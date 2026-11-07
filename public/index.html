@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XYCAD · CAD 图纸预览</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="viewer.mjs"></script>
+</head>
+<body>
+  <header class="header">
+    <div class="brand"><div class="brand-mark" aria-hidden="true">XY</div><div><h1>XYCAD</h1><p>二维图纸与三维模型预览</p></div></div>
+    <div class="local"><a id="host-home" href="/" hidden>返回 BDYC</a> <a id="host-uploads" href="/upload-preview" hidden>上传记录与文档</a> <a id="host-download" hidden>下载原图</a> <a id="host-legacy" hidden>原预览</a><span aria-hidden="true"></span> XYCAD 自托管解析</div>
+  </header>
+  <main class="workspace">
+    <div id="host-tools" class="toolbar" aria-label="BDYC 图纸联动" hidden>
+      <div class="tools"><button type="button" data-host-action="save" disabled>保存原图副本</button><button type="button" data-host-action="save-export" disabled>保存最近导出到记录</button><button type="button" data-host-action="bending-quote" disabled>用于报价</button><button type="button" data-host-action="bending-simulation" disabled>用于折弯预检</button><button type="button" data-host-action="modeling" disabled>由二维图建模</button></div>
+      <span id="host-status" role="status"></span>
+    </div>
+    <div class="toolbar" aria-label="图纸工具栏">
+      <div class="tools">
+        <button class="primary" id="open" type="button">打开图纸</button>
+        <input id="file" type="file" hidden>
+        <button id="sample" type="button">查看样图</button>
+        <button id="open-bdyc" type="button" hidden>打开 BDYC 图纸</button>
+        <button id="download" type="button" hidden>下载 DXF</button>
+        <button id="native-solidworks" type="button" hidden>SOLIDWORKS 本机读取</button>
+        <button id="make-projection" type="button" hidden>生成三视图</button>
+        <button id="back-to-mesh" type="button" hidden>返回三维</button>
+        <div id="projection-export" class="sheet-export" hidden>
+          <label class="projection-hidden"><input id="projection-hidden" type="checkbox" checked> 遮挡线</label>
+          <select id="projection-format" aria-label="选择三视图导出格式">
+            <option value="dxf">可编辑 DXF</option>
+            <option value="pdf">矢量 PDF</option>
+          </select>
+          <button id="download-projection" type="button">下载三视图 DXF</button>
+        </div>
+        <div id="sheet-export" class="sheet-export" hidden>
+          <select id="sheet-format" aria-label="选择工程图导出格式">
+            <option value="">选择导出格式</option>
+            <option value="pdf">PDF</option>
+            <option value="dxf">可编辑 DXF</option>
+          </select>
+          <button id="download-sheet" type="button" disabled>导出</button>
+        </div>
+        <label id="block-picker" hidden>图块 <select id="block-view" aria-label="选择图块预览"></select></label>
+        <label id="part-config-picker" hidden>配置 <select id="part-configuration" aria-label="选择零件配置"></select></label>
+      </div>
+      <div class="tools view-tools">
+        <select id="measure-mode" aria-label="测量工具" hidden><option value="">测量</option></select>
+        <select id="projection-front" aria-label="三视图主视方向" title="从所选方向看向模型" hidden>
+          <option value="ny">主视方向 −Y</option>
+          <option value="py">主视方向 +Y</option>
+          <option value="nx">主视方向 −X</option>
+          <option value="px">主视方向 +X</option>
+          <option value="nz">主视方向 −Z</option>
+          <option value="pz">主视方向 +Z</option>
+        </select>
+        <select id="mesh-view" aria-label="三维视角" hidden>
+          <option value="iso">等轴测</option>
+          <option value="front">正视</option>
+          <option value="right">右视</option>
+          <option value="top">俯视</option>
+          <option value="custom" disabled>自由视角</option>
+        </select>
+        <button id="out" type="button" aria-label="缩小" disabled>−</button>
+        <button id="in" type="button" aria-label="放大" disabled>+</button>
+        <button id="fit" type="button" disabled>适合窗口</button>
+      </div>
+    </div>
+    <div class="file-bar"><strong id="file-name">尚未打开图纸</strong><span id="file-meta"></span></div>
+    <form id="bdyc-source" class="tools" hidden>
+      <input id="bdyc-path" aria-label="BDYC 图纸路径" placeholder="填写 BDYC 图纸路径" maxlength="4096" required>
+      <button type="submit">读取原图</button>
+      <a id="bdyc-login" target="_blank" rel="noopener noreferrer">登录 BDYC</a>
+    </form>
+    <section id="measure-panel" class="measure-panel" aria-label="测量结果" hidden>
+      <div><output id="measure-result" role="status" aria-live="polite"></output><small id="measure-caption"></small></div>
+      <div class="tools">
+        <label class="measure-snap"><input id="measure-snap" type="checkbox" checked> 吸附</label>
+        <label id="measure-scale-label" class="measure-snap" hidden>视图比例 1∶<input id="measure-scale" type="number" value="1" min="0.000001" max="1000000" step="any" aria-label="视图比例中对应的模型尺寸"></label>
+        <button id="measure-close" type="button" hidden>闭合面积</button>
+        <button id="measure-undo" type="button">撤销点</button>
+        <button id="measure-clear" type="button">清除</button>
+      </div>
+    </section>
+    <div id="message" class="message" role="status" hidden></div>
+    <div id="work-area" class="work-area">
+      <section id="viewport" class="viewport" aria-label="图纸预览区">
+        <svg id="drawing" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CAD 图纸预览" viewBox="0 0 100 100">
+          <g id="world" transform="scale(1 -1)"></g>
+        </svg>
+        <canvas id="drawing-motion" aria-hidden="true" hidden></canvas>
+        <canvas id="mesh-canvas" role="img" aria-label="三维模型预览" hidden></canvas>
+        <svg id="measure-overlay" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+        <div id="empty" class="empty">
+          <svg width="66" height="66" viewBox="0 0 66 66" fill="none" aria-hidden="true">
+            <rect x="10" y="10" width="46" height="46" rx="10" stroke="currentColor" opacity=".35"/>
+            <path d="M21 46V22m0 24h24M25 40l8-12 7 7 6-12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <h2 id="empty-title">将图纸拖到此处</h2>
+          <p id="empty-note">请选择非空 CAD 文件</p>
+        </div>
+        <div id="drop" class="drop" hidden>松开以打开图纸</div>
+        <div class="axis" id="axis" aria-hidden="true">↗ XY</div>
+      </section>
+      <aside class="sidebar" aria-labelledby="layers-title">
+        <div class="sidebar-title"><h2 id="layers-title">图层</h2><span id="layer-count">0</span></div>
+        <div id="layer-controls" class="layer-controls" hidden>
+          <button type="button" id="show-layers">全显</button>
+          <button type="button" id="hide-layers">全隐藏</button>
+          <button type="button" id="reset-layers">恢复原始</button>
+        </div>
+        <p id="layers-empty" class="layers-empty">打开图纸后显示图层。</p>
+        <div id="sheet-controls" class="sheet-controls" hidden>
+          <select id="sheet-view" aria-label="选择工程图纸页"></select>
+          <div>
+            <button id="previous-sheet" type="button">上一页</button>
+            <button id="next-sheet" type="button">下一页</button>
+          </div>
+        </div>
+        <dl id="mesh-info" hidden>
+          <dt title="X × Y × Z">外包尺寸</dt><dd id="mesh-size"></dd>
+          <dt>长度单位</dt><dd id="mesh-unit"></dd>
+        </dl>
+        <div id="mesh-explosion" class="mesh-explosion" hidden>
+          <label for="mesh-spread">爆炸视图</label>
+          <output id="mesh-spread-value" for="mesh-spread">0%</output>
+          <button id="mesh-reset-spread" type="button">复位</button>
+          <input id="mesh-spread" type="range" min="0" max="100" value="0">
+        </div>
+        <div id="mesh-tree-controls" class="layer-controls" hidden>
+          <button type="button" id="show-parts">全显</button>
+          <button type="button" id="hide-parts">全隐藏</button>
+        </div>
+        <ul id="mesh-tree" class="mesh-tree" aria-label="装配结构" hidden></ul>
+        <ul id="layers" class="layer-list"></ul>
+      </aside>
+    </div>
+    <footer class="status"><span id="view-hints">模型空间 · 滚轮缩放 · 拖动平移 · 双击适配</span><span id="visible-count">等待图纸</span></footer>
+    <details id="warnings" class="warnings" hidden><summary id="warning-summary">预览提示</summary><ul id="warning-list"></ul></details>
+    <section id="preview-diagnostics" class="warnings" aria-label="预览诊断" hidden>
+      <button id="run-diagnostics" type="button">向 OpenAI 查询预览原因</button>
+      <p>点击后仅发送文件格式和预览状态。</p>
+      <p id="diagnostic-answer" role="status"></p>
+    </section>
+  </main>
+</body>
+</html>

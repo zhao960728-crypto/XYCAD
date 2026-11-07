@@ -1,0 +1,26 @@
+XYCAD
+Copyright 2026 zhao960728-crypto (阿阳有想法) and XYCAD contributors.
+
+Original project / 原始项目:
+https://github.com/zhao960728-crypto/XYCAD
+Original publisher / 原始发布者: zhao960728-crypto（阿阳有想法）
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+When redistributing this project or derivative works, preserve the applicable
+copyright and attribution notices in accordance with section 4 of the License.
+Modified files must carry prominent notices stating that they were changed.
+This NOTICE supplies attribution information and does not modify the License.
+
+本项目采用 Apache-2.0 许可。可使用、修改、商用和二次开发；再分发时须依许可
+保留适用的版权、许可和出处声明，并在修改文件中明确注明修改。
+本声明不增加 Apache-2.0 之外的限制，也不表示原作者为衍生产品背书。
+
+Optional external component / 可选外部组件:
+sldprt2step — https://github.com/BlinkingSun/sldprt2step
+Verified revision: fa954124f4f126e0c465c8f96454978ac80b812e
+Licensed separately under Apache-2.0; not bundled in this repository.
+If distributed separately or together, retain its original LICENSE and NOTICE.
+
+CAD product and format names identify interoperability targets only.
+Their trademarks belong to their respective owners; no affiliation or
+endorsement by Autodesk, Dassault Systèmes, Siemens or other CAD vendors is implied.
