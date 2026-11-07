@@ -1,19 +1,17 @@
 XYCAD
-Copyright 2026 zhao960728-crypto (阿阳有想法) and XYCAD contributors.
+Copyright (c) 2026 zhao960728-crypto (阿阳有想法) and XYCAD contributors.
+Original source / 原始出处: https://github.com/zhao960728-crypto/XYCAD
 
-Original project / 原始项目:
-https://github.com/zhao960728-crypto/XYCAD
-Original publisher / 原始发布者: zhao960728-crypto（阿阳有想法）
+Licensed under the MIT License. See LICENSE.
+Free use, copying, modification, commercial use and secondary development
+are permitted. Retain the copyright, original-source attribution and the
+accompanying permission notice when copying or redistributing the software
+or substantial portions of it. No separate authorization is required.
 
-Licensed under the Apache License, Version 2.0. See LICENSE.
-When redistributing this project or derivative works, preserve the applicable
-copyright and attribution notices in accordance with section 4 of the License.
-Modified files must carry prominent notices stating that they were changed.
-This NOTICE supplies attribution information and does not modify the License.
-
-本项目采用 Apache-2.0 许可。可使用、修改、商用和二次开发；再分发时须依许可
-保留适用的版权、许可和出处声明，并在修改文件中明确注明修改。
-本声明不增加 Apache-2.0 之外的限制，也不表示原作者为衍生产品背书。
+本项目采用 MIT 许可，可自由使用、复制、修改、商用、再分发和二次开发。
+复制或再分发本软件或其重要部分时，保留版权、原始出处和随附许可声明即可，
+无需另行申请许可，无需公开二开源码，也无需逐个标注修改文件。
+本出处说明不代表原作者为衍生产品背书，不增加 MIT 许可之外的限制。
 
 Optional external component / 可选外部组件:
 sldprt2step — https://github.com/BlinkingSun/sldprt2step

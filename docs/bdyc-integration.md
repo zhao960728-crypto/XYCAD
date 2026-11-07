@@ -20,6 +20,6 @@ node scripts/package-bdyc.mjs 'D:/my-host/tools/xycad/runtime'
 
 可参考 `src/embedded-access.mjs`、`public/host-tools.mjs`、`test/embedded-host.test.mjs`。`XYCAD_HOST_TOKEN` 为宿主管理的 64 位十六进制秘密，不得写到公开网页或仓库。宿主须验证登录、来源权限和跨站请求，并生成与账号/会话/浏览器绑定的作用域；网格与投影缓存也依此隔离。
 
-宿主侧的保存、来源复用、下载签名、账号配额、诊断与任务入口需要匹配的服务实现，仅复制本仓库不会自动具备。运行包更新应同时保留 LICENSE/NOTICE，修改文件声明自身改动。不要把生产密钥或业务样本加入公开包。
+宿主侧的保存、来源复用、下载签名、账号配额、诊断与任务入口需要匹配的服务实现，仅复制本仓库不会自动具备。运行包更新保留版权、出处与随附许可声明即可。不要把生产密钥或业务样本加入公开包。
 
 既有集成主要在 Windows 验证；独立自动测试含模拟宿主和权限隔离检查，不能视为已部署任何外部 BDYC 或 Linux 环境。解析、测量及三视图仍受[已知限制](known-limitations.md)约束。
