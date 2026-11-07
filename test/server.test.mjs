@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm, rmdir, writeFile } from 'node:fs/promises';
-import { createServer, request as httpRequest } from 'node:http';
+import { mkdtemp, readFile, readdir, rmdir } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,11 +11,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MiB } from '../public/cad-limits.mjs';
 import { parseDxf, name, number } from '../src/dxf-parser.mjs';
-import { explainPreview } from '../src/preview-diagnostics.mjs';
 
-async function startServer(t, converter = '', environment = {}) {
+async function startServer(t, environment = {}) {
   const child = spawn(process.execPath, [fileURLToPath(new URL('../server.mjs', import.meta.url))], {
-    env: { ...process.env, ...environment, XYCAD_HOST: '127.0.0.1', XYCAD_PORT: '0', XYCAD_DWG_CONVERTER: converter },
+    env: { ...process.env, ...environment, XYCAD_HOST: '127.0.0.1', XYCAD_PORT: '0' },
     stdio: ['ignore', 'pipe', 'inherit'],
     windowsHide: true,
   });
@@ -30,8 +29,8 @@ async function startServer(t, converter = '', environment = {}) {
 const post = (url, body, query = '') => fetch(url + 'api/preview' + query,
   { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body });
 
-test('SLDPRT upload requires the offline parser even when the SOLIDWORKS bridge is enabled', async t => {
-  const url = await startServer(t, '', { XYCAD_SLDPRT_PARSER_DIR: '', XYCAD_SOLIDWORKS: '1' });
+test('SLDPRT upload requires the offline parser and validates configuration IDs', async t => {
+  const url = await startServer(t, { XYCAD_SLDPRT_PARSER_DIR: '' });
   const result = await fetch(url + 'api/preview', {
     method: 'POST', body: 'part upload',
     headers: { 'Content-Type': 'application/octet-stream', 'X-XYCAD-Format': 'sldprt' },
@@ -89,83 +88,6 @@ test('shared STEP preview keeps repeated occurrences in one mesh and projects th
   const dxf = await fetch(asset + '/projection?part=0.1&front=pz&format=dxf');
   assert.match(dxf.headers.get('content-type'), /application\/dxf/);
   assert.ok(parseDxf(Buffer.from(await dxf.arrayBuffer())).entities.some(entity => entity.type === 'LINE'));
-});
-
-test('preview diagnostics defaults off and rejects cross-origin requests when configured', async t => {
-  const disabled = await startServer(t, '', { XYCAD_OPENAI_API_KEY: '', XYCAD_OPENAI_MODEL: '' });
-  const route = 'api/preview-diagnostics';
-  assert.deepEqual(await (await fetch(disabled + route)).json(), { enabled: false });
-  const enabled = await startServer(t, '', { XYCAD_OPENAI_API_KEY: 'test-only', XYCAD_OPENAI_MODEL: 'test-model' });
-  assert.deepEqual(await (await fetch(enabled + route)).json(), { enabled: true });
-  const endpoint = enabled + route + '?format=slddrw&status=partial';
-  assert.equal((await fetch(endpoint, { method: 'POST', headers: { Origin: 'https://other.test' } })).status, 403);
-  const headers = { Origin: new URL(enabled).origin };
-  assert.equal((await fetch(endpoint, { method: 'POST', headers, body: 'drawing bytes' })).status, 400);
-  assert.equal((await fetch(endpoint + '&name=file', { method: 'POST', headers })).status, 400);
-});
-
-test('preview diagnostics sends only the format and state to the official Responses endpoint', async () => {
-  const result = await explainPreview({ apiKey: 'test-only', model: 'test-model', format: 'x_t', status: 'partial' },
-    async (url, options) => {
-      assert.equal(url, 'https://api.openai.com/v1/responses');
-      assert.equal(options.headers.Authorization, 'Bearer test-only');
-      const payload = JSON.parse(options.body);
-      assert.equal(payload.store, false);
-      assert.deepEqual(JSON.parse(payload.input), { format: 'x_t', preview: 'partial' });
-      return Response.json({ status: 'completed', output: [{ type: 'reasoning' }, { type: 'message', role: 'assistant',
-        content: [{ type: 'output_text', text: '诊断结果' }] }] });
-    });
-  assert.deepEqual(result, { text: '诊断结果' });
-});
-
-test('the BDYC bridge streams the original through the existing user session', async t => {
-  const bytes = await readFile(new URL('../public/sample.dxf', import.meta.url));
-  const requests = [];
-  const bdyc = createServer((request, response) => {
-    requests.push({ url: request.url, cookie: request.headers.cookie });
-    response.writeHead(200, { 'Content-Type': 'image/vnd.dxf', 'Content-Disposition': 'attachment; filename="source.dxf"' });
-    response.end(bytes);
-  });
-  t.after(() => bdyc.close());
-  bdyc.listen(0, '127.0.0.1');
-  await once(bdyc, 'listening');
-  const origin = 'http://127.0.0.1:' + bdyc.address().port;
-  const url = await startServer(t, '', { XYCAD_BDYC_ORIGIN: origin });
-  const source = url + 'api/bdyc-file';
-  assert.deepEqual(await (await fetch(source)).json(), { login: origin + '/login' });
-  const path = '图纸/2026/样图.dxf';
-  const target = source + '?' + new URLSearchParams({ path });
-  const headers = { 'X-XYCAD-BDYC': '1' };
-  assert.equal((await fetch(target, { headers })).status, 401);
-  const session = 'bdyc_session=' + 'A'.repeat(43);
-  const cookie = session + '; other=value';
-  assert.equal((await fetch(target, { headers: { Cookie: cookie } })).status, 403);
-  assert.equal((await fetch(source + '?path=abc/../sample.dxf', { headers: { ...headers, Cookie: cookie } })).status, 400);
-  const response = await fetch(target, { headers: { ...headers, Cookie: cookie } });
-  assert.equal(response.status, 200);
-  assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
-  assert.deepEqual(requests, [{ url: '/download?' + new URLSearchParams({ path }), cookie: session }]);
-  assert.equal((await post(url, bytes)).status, 200);
-});
-
-test('official SOLIDWORKS conversion is opt-in and rejects invalid requests before launching', async t => {
-  const disabled = await startServer(t, '', { XYCAD_SOLIDWORKS: '' });
-  const route = 'api/solidworks';
-  assert.deepEqual(await (await fetch(disabled + route)).json(), { enabled: false });
-  if (process.platform !== 'win32') return;
-  const enabled = await startServer(t, '', { XYCAD_SOLIDWORKS: '1' });
-  const endpoint = enabled + route + '?format=dxf';
-  assert.deepEqual(await (await fetch(enabled + route)).json(), { enabled: true });
-  assert.equal((await fetch(endpoint, { method: 'POST', headers: { Origin: 'https://other.test' } })).status, 403);
-  const result = await fetch(endpoint, { method: 'POST', headers: { Origin: new URL(enabled).origin,
-    'Content-Type': 'application/octet-stream' }, body: 'invalid container' });
-  assert.equal(result.status, 422);
-  assert.match((await result.json()).error, /有效的 SLDDRW/);
-  const partServer = await startServer(t, '', { XYCAD_SOLIDWORKS: '1' });
-  const part = await fetch(partServer + route + '?format=step', { method: 'POST',
-    headers: { Origin: new URL(partServer).origin, 'Content-Type': 'application/octet-stream' }, body: 'invalid container' });
-  assert.equal(part.status, 422);
-  assert.match((await part.json()).error, /有效的 SLDPRT/);
 });
 
 function savedSheetPng(color, rgba = false) {
@@ -658,7 +580,7 @@ test('a block view displays editable DXF multileader geometry without placing th
 
 test('accepts a chunked upload and a complete file above the old upload ceiling', { timeout: 30000 }, async t => {
   const storage = await mkdtemp(join(tmpdir(), 'xycad-test-upload-'));
-  const url = await startServer(t, '', { TEMP: storage, TMP: storage, TMPDIR: storage });
+  const url = await startServer(t, { TEMP: storage, TMP: storage, TMPDIR: storage });
   t.after(() => rmdir(storage));
   const source = await readFile(new URL('../public/sample.dxf', import.meta.url));
   const dxf = Buffer.concat([Buffer.from('999\n'), Buffer.alloc(16 * MiB, 32), Buffer.from('\n'), source]);
@@ -711,51 +633,14 @@ test('accepts a chunked upload and a complete file above the old upload ceiling'
   await waitForEntries(0);
 });
 
-test('a local DWG converter uses the same DXF pipeline, with native preview as a fallback', { timeout: 10000 }, async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'xycad-test-converter-'));
-  const file = join(dir, 'convert.mjs');
-  t.after(async () => {
-    await rm(file);
-    await rmdir(dir);
-  });
-  const sample = new URL('../public/sample.dxf', import.meta.url).href;
-  await writeFile(file, `
-    import { readFile } from 'node:fs/promises';
-    export async function convertDwg(bytes, { version }) {
-      if (bytes[10] === 2) process.exit(9);
-      if (version !== 'AC1024' || bytes[10] === 1) {
-        bytes.fill(0);
-        throw new Error('fixture could not convert file');
-      }
-      return readFile(new URL(${JSON.stringify(sample)}));
-    }
-  `);
-  const url = await startServer(t, file);
-  const bytes = dwgWithBitmap();
-  const converted = await post(url, bytes);
-  assert.equal(converted.status, 200);
-  const { scene } = await converted.json();
-  assert.equal(scene.dwgVersion, 'AC1024');
-  assert.ok(scene.items.some(item => item.content === '180'));
-  const exported = await fetch(url + 'api/convert', { method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' }, body: bytes });
-  assert.equal(exported.status, 200);
-  assert.equal(exported.headers.get('Content-Type'), 'application/dxf');
-  assert.match(await exported.text(), /COPPER BUSBAR/);
-  bytes[10] = 1;
-  const fallback = await post(url, bytes);
-  assert.equal(fallback.status, 200);
-  const fallbackScene = (await fallback.json()).scene;
-  assert.equal(fallbackScene.image.mime, 'image/bmp');
-  assert.match(fallbackScene.issues[0][0], /转换模块未返回有效结果/);
-  const large = Buffer.alloc(4 * MiB);
-  bytes.copy(large);
-  large[10] = 2;
-  const aborted = await post(url, large);
-  assert.equal(aborted.status, 422);
-  assert.match((await aborted.json()).error, /大图解析未完成/);
-  large[10] = 0;
-  const recovered = await post(url, large);
-  assert.equal(recovered.status, 200);
-  assert.ok((await recovered.json()).scene.items.some(item => item.content === '180'));
+
+test('standalone preview has no external service or desktop CAD routes', async t => {
+  const url = await startServer(t);
+  for (const route of ['api/bdyc-file', 'api/preview-diagnostics', 'api/solidworks', 'host-tools.mjs']) {
+    assert.equal((await fetch(url + route)).status, 404, route);
+  }
+  const page = await (await fetch(url)).text();
+  assert.doesNotMatch(page, /open-bdyc|native-solidworks|run-diagnostics|host-tools/);
+  const bytes = await readFile(new URL('../public/sample.dxf', import.meta.url));
+  assert.equal((await post(url, bytes)).status, 200);
 });

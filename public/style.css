@@ -192,7 +192,6 @@ polygon.measure-geometry { fill: #ffd16a32; }
 .warnings { margin-top: .7rem; padding: .65rem .8rem; border: 1px solid #5b4b32; border-radius: 7px; background: #272217; color: #f5d699; font-size: .84rem; }
 .warnings summary { cursor: pointer; }
 .warnings ul { margin: .55rem 0 .1rem; padding-left: 1.25rem; line-height: 1.5; overflow-wrap: anywhere; }
-#diagnostic-answer { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 680px) {
   .work-area, .work-area.is-3d { grid-template-columns: minmax(0, 1fr); }
   .sidebar { border-left: 0; border-top: 1px solid var(--line); max-height: 220px; }

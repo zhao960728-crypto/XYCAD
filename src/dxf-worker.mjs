@@ -1,5 +1,4 @@
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { pathToFileURL } from 'node:url';
 import { hasDxfHeader, key, name, parseDxf } from './dxf-parser.mjs';
 import { projectionHiddenLayers } from '../public/cad-limits.mjs';
 import { buildScene } from './dxf-scene.mjs';
@@ -105,7 +104,7 @@ export function projectMesh(scene, output, part, hidden, front) {
     ...(part && { projectionPart: { path: part, label: scene.partLabel } }) } };
 }
 
-export async function buildPreview({ bytes, converter, download, block = '', streamExport = false, formatHint, partPath }) {
+export async function buildPreview({ bytes, download, block = '', streamExport = false, formatHint, partPath }) {
   if (!download && !block) {
     if (formatHint === 'slddrw') return { scene: solidWorksPreview(bytes, true) };
     if (formatHint === 'stl') return { scene: readStlPreview(bytes, true) };
@@ -146,19 +145,11 @@ export async function buildPreview({ bytes, converter, download, block = '', str
   }
   let reason = '';
   const native = nativeConverters.get(version);
-  if (converter || native) {
+  if (native) {
     try {
-      let result;
-      if (converter) {
-        const { convertDwg } = await import(pathToFileURL(converter).href);
-        // A configured module receives its own copy of the input.
-        result = { dxf: await convertDwg(Uint8Array.from(bytes), { version }), warnings: [] };
-      } else {
-        const source = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-        result = native(source, { preview: !download, keepChunks: download && streamExport });
-        // The native serializer has already validated the DXF structure and size.
-        if (download) return streamExport ? { dxfChunks: result.dxfChunks } : { dxf: result.dxf };
-      }
+      const source = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const result = native(source, { preview: !download, keepChunks: download && streamExport });
+      if (download) return streamExport ? { dxfChunks: result.dxfChunks } : { dxf: result.dxf };
       const { dxf, warnings, modelOnly, emptyModel } = result;
       if (!(dxf instanceof Uint8Array) || !dxf.length || dxf.length > dxfExportBytes) {
         throw new Error('转换结果超出本版 DXF 容量。');
@@ -172,7 +163,7 @@ export async function buildPreview({ bytes, converter, download, block = '', str
       return { scene: { ...scene, issues: [...modeNotice, ...warnings, ...scene.issues], dwgVersion: version,
         ...(modelOnly ? { previewMode: 'model' } : {}) } };
     } catch (error) {
-      reason = converter ? '配置的 DWG 转换模块未返回有效结果。' : error.message;
+      reason = error.message;
     }
   }
   if (download) return { error: reason || `内置转换当前支持 DWG ${[...nativeConverters.keys()].join('、')}。` };

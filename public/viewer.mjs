@@ -1,7 +1,6 @@
 import { formatHints, uploadExtensions, uploadHint, projectionHiddenLayers, projectionTriangleLimit } from './cad-limits.mjs';
 import { MeshViewer, partColor } from './mesh-viewer.mjs';
 import { drawingUnits } from './cad-measure.mjs';
-import { createHostTools } from './host-tools.mjs';
 import { createMeasureTools } from './measure-tools.mjs';
 import { createDrawingBuffer } from './drawing-buffer.mjs';
 const byId = id => document.getElementById(id);
@@ -34,112 +33,13 @@ const projectionFormat = byId('projection-format');
 const projectionExport = byId('projection-export');
 const projectionHidden = byId('projection-hidden');
 const projectionFront = byId('projection-front');
-const diagnostics = byId('preview-diagnostics');
-const diagnose = byId('run-diagnostics');
-const diagnosticAnswer = byId('diagnostic-answer');
-const nativeSolidWorks = byId('native-solidworks');
 const state = { items: [], layers: [], view: null, request: null };
 const bufferedPanThreshold = 10_000;
-let solidWorksEnabled = false;
-fetch('./api/solidworks').then(response => response.json()).then(({ enabled }) => {
-  solidWorksEnabled = enabled === true;
-  nativeSolidWorks.hidden = !solidWorksEnabled || !state.solidWorksSource;
-}).catch(() => {});
-let diagnosticEnabled = false, diagnosticContext, diagnosticRequest;
-fetch('./api/preview-diagnostics').then(response => response.json()).then(({ enabled }) => {
-  diagnosticEnabled = enabled === true;
-  diagnostics.hidden = !diagnosticEnabled || !diagnosticContext;
-}).catch(() => {});
-function setDiagnosticContext(filename, status) {
-  diagnosticRequest?.abort();
-  diagnosticRequest = undefined;
-  const format = filename.split('.').at(-1)?.toLowerCase();
-  diagnosticContext = status && uploadExtensions.includes(format) ? { format, status } : undefined;
-  diagnostics.hidden = !diagnosticEnabled || !diagnosticContext;
-  diagnose.disabled = false;
-  diagnosticAnswer.textContent = '';
-}
-diagnose.addEventListener('click', async () => {
-  if (!diagnosticContext || diagnosticRequest) return;
-  const request = new AbortController();
-  diagnosticRequest = request;
-  diagnose.disabled = true;
-  diagnosticAnswer.textContent = '正在请求诊断…';
-  try {
-    const response = await fetch('./api/preview-diagnostics?' + new URLSearchParams(diagnosticContext),
-      { method: 'POST', signal: request.signal });
-    const result = await response.json();
-    if (diagnosticRequest === request) diagnosticAnswer.textContent = result.text || result.error || '未收到诊断结果。';
-  } catch {
-    if (diagnosticRequest === request) diagnosticAnswer.textContent = '诊断请求未完成。';
-  } finally {
-    if (diagnosticRequest === request) {
-      diagnosticRequest = undefined;
-      diagnose.disabled = false;
-    }
-  }
-});
 let meshViewer;
 const measurement = createMeasureTools(viewport, drawingMatrix, () => state.items, () => meshViewer);
 const measure = document.createElement('canvas').getContext('2d');
 measure.font = '100px "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif';
 const segmenter = new Intl.Segmenter('zh', { granularity: 'word' });
-
-const bdycSource = byId('bdyc-source');
-const hostTools = createHostTools();
-const openBdyc = byId('open-bdyc');
-fetch('./api/bdyc-file').then(response => response.json()).then(({ login, embedded }) => {
-  if (login) {
-    byId('bdyc-login').href = login;
-    openBdyc.hidden = false;
-  }
-  if (embedded) {
-    hostTools.enable();
-    diagnose.textContent = 'AI 辅助排查';
-    byId('host-home').hidden = false;
-    byId('host-home').target = '_top';
-    byId('host-uploads').hidden = false;
-    byId('host-uploads').target = '_top';
-    byId('bdyc-login').textContent = '返回账号登录';
-  }
-  const current = new URLSearchParams(location.search);
-  const path = current.get('path'), source = current.get('source');
-  const filename = current.get('name') || path?.replaceAll('\\', '/').split('/').at(-1);
-  if (embedded && (path || source)) {
-    byId('host-download').href = path ? '/download?' + new URLSearchParams({path}) : './api/bdyc-file?' + new URLSearchParams({source, name:filename || ''});
-    // Task downloads must pass through the host's original permission-checked route.
-    if (source && /^\/drawing\/api\//.test(source)) byId('host-download').href = source;
-    byId('host-download').hidden = false;
-    if (path) {
-      byId('host-legacy').href = '/view?' + new URLSearchParams({path, viewer:'legacy'});
-      byId('host-legacy').hidden = false;
-    }
-  }
-  if (login && filename && (path || embedded && source)) {
-    const params = new URLSearchParams(path ? { path } : { source, name: filename });
-    loadBdycDrawing(filename, params);
-  }
-}).catch(() => {});
-function loadBdycDrawing(filename, params) {
-  const extension = filename.split('.').at(-1).toLowerCase();
-  if (!uploadExtensions.includes(extension)) return setMessage('此格式请使用 BDYC 原预览或下载原件。', true);
-  openDrawing(filename, async signal => {
-    const response = await fetch('./api/bdyc-file?' + params,
-      { signal, headers: { 'X-XYCAD-BDYC': '1' }, cache: 'no-store' });
-    if (!response.ok) throw new Error((await response.json()).error || '无法读取 BDYC 图纸。');
-    return new File([await response.blob()], filename);
-  }, '', extension, false, undefined, Object.fromEntries(params));
-}
-openBdyc.addEventListener('click', () => {
-  bdycSource.hidden = !bdycSource.hidden;
-  if (!bdycSource.hidden) byId('bdyc-path').focus();
-});
-bdycSource.addEventListener('submit', event => {
-  event.preventDefault();
-  const path = byId('bdyc-path').value.trim().replaceAll('\\', '/');
-  const filename = path.split('/').at(-1);
-  loadBdycDrawing(filename, new URLSearchParams({ path }));
-});
 
 function svg(tag, attributes = {}) {
   const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
@@ -794,8 +694,7 @@ function updatePartConfigurations(details, file, filename) {
   partConfiguration.value = details.selectedConfiguration;
 }
 
-async function openDrawing(filename, readFile, block = '', formatHint, native = false, configuration, hostContext) {
-  if (!block) setDiagnosticContext(filename);
+async function openDrawing(filename, readFile, block = '', formatHint, configuration) {
   state.request?.abort();
   const request = new AbortController();
   state.request = request;
@@ -805,13 +704,8 @@ async function openDrawing(filename, readFile, block = '', formatHint, native = 
   partConfiguration.disabled = true;
   try {
     const file = await readFile(signal);
-    if (formatHint === 'slddrw' && !native) {
-      state.solidWorksSource = { file, filename };
-      nativeSolidWorks.hidden = !solidWorksEnabled;
-    }
-    const route = native ? './api/solidworks?format=preview' :
-      block ? `./api/preview?block=${encodeURIComponent(block)}` : './api/preview';
-    const shared = !native && !block && ['x_t', 'step', 'stp'].includes(formatHint);
+    const route = block ? `./api/preview?block=${encodeURIComponent(block)}` : './api/preview';
+    const shared = !block && ['x_t', 'step', 'stp'].includes(formatHint);
     const response = await fetch(route, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream', ...(formatHint && { 'X-XYCAD-Format': formatHint }),
@@ -828,32 +722,22 @@ async function openDrawing(filename, readFile, block = '', formatHint, native = 
     if (!response.ok) throw new Error(result.error || '图纸读取失败。');
     if (formatHint !== 'sldprt') updatePartConfigurations(null);
     loadScene(result.scene, filename);
-    hostTools.loaded(file, hostContext);
     state.meshSource = result.scene.mesh ? { scene: result.scene, file, filename, formatHint } : null;
     state.previewFile = result.scene.blockViews?.length ? file : null;
     state.downloadFile = result.scene.dwgVersion && !result.scene.image ? file : null;
     const vector = result.scene.dxfAvailable;
     const pdf = result.scene.pdfAvailable;
     state.sheetFile = vector || pdf ? file : null;
-    state.nativeSheets = native ? result.scene.sheets.length : 0;
-    if (formatHint !== 'slddrw') {
-      state.solidWorksSource = null;
-      nativeSolidWorks.hidden = true;
-    }
     sheetFormat.querySelector('[value="dxf"]').disabled = !vector;
     sheetFormat.querySelector('[value="pdf"]').disabled = !pdf;
     download.hidden = !state.downloadFile;
     byId('sheet-export').hidden = !state.sheetFile;
     sheetFormat.value = '';
     downloadSheet.disabled = true;
-    if (!block && (result.scene.projectionAvailable === false || result.scene.dxfAvailable === false || result.scene.image)) {
-      setDiagnosticContext(filename, 'partial');
-    }
     setMessage('');
   } catch (error) {
     if (state.request === request) {
       blockView.value = state.block ?? '';
-      if (!block) setDiagnosticContext(filename, 'failed');
       showOpenFailure(filename, signal.aborted ? '预览请求超时，请重试。' : error.message);
     }
   } finally {
@@ -865,14 +749,6 @@ async function openDrawing(filename, readFile, block = '', formatHint, native = 
   }
 }
 
-nativeSolidWorks.addEventListener('click', async () => {
-  const source = state.solidWorksSource;
-  if (!source || state.request) return;
-  nativeSolidWorks.disabled = true;
-  try { await openDrawing(source.filename, () => source.file, '', 'slddrw', true); }
-  finally { nativeSolidWorks.disabled = false; }
-});
-
 blockView.addEventListener('change', () => {
   const file = state.previewFile;
   if (file) openDrawing(byId('file-name').textContent, () => file, blockView.value);
@@ -880,7 +756,7 @@ blockView.addEventListener('change', () => {
 
 partConfiguration.addEventListener('change', () => {
   const source = state.partSource;
-  if (source) openDrawing(source.filename, () => source.file, '', 'sldprt', false, partConfiguration.value);
+  if (source) openDrawing(source.filename, () => source.file, '', 'sldprt', partConfiguration.value);
 });
 
 async function saveDrawing(key, route, suffix, formatHint) {
@@ -907,7 +783,6 @@ async function saveDrawing(key, route, suffix, formatHint) {
     const link = document.createElement('a');
     link.href = url;
     link.download = (file.name || '图纸').replace(/\.[^.]+$/, '') + suffix;
-    hostTools.exported(blob,link.download,file);
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   } catch (error) {
@@ -1031,9 +906,7 @@ downloadSheet.addEventListener('click', async () => {
   const format = sheetFormat.value;
   if (!format) return;
   downloadSheet.disabled = sheetFormat.disabled = true;
-  const native = state.nativeSheets > 0;
-  const extension = format === 'dxf' && state.nativeSheets > 1 ? 'dxf.zip' : format;
-  try { await saveDrawing('sheetFile', (native ? './api/solidworks' : './api/export') + '?format=' + format, '.xycad.' + extension); }
+  try { await saveDrawing('sheetFile', './api/export?format=' + format, '.xycad.' + format); }
   finally {
     sheetFormat.disabled = false;
     downloadSheet.disabled = !sheetFormat.value;

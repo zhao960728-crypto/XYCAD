@@ -15,7 +15,7 @@ import { validateSavedPart } from './sldprt-validation.mjs';
 globalThis.console = new Console(process.stderr);
 
 async function run() {
-  const [file, operation, converter, block, formatHint, part, hidden, front, directory, asset] = process.argv.slice(2);
+  const [file, operation, block, formatHint, part, hidden, front, directory, asset] = process.argv.slice(2);
   if (operation.startsWith('asset-projection')) {
     const scene = readAssemblyProjection(directory, part ? part.split('.').map(Number) : undefined);
     return projectMesh(scene, operation.slice(17), part, hidden, front);
@@ -48,7 +48,7 @@ async function run() {
   if (operation.startsWith('projection')) {
     return buildProjection(bytes, formatHint, operation.slice(11), part, hidden, front);
   }
-  return buildPreview({ bytes, converter, block, formatHint, download: operation === 'convert', streamExport: true });
+  return buildPreview({ bytes, block, formatHint, download: operation === 'convert', streamExport: true });
 }
 
 let result;
@@ -56,7 +56,7 @@ try {
   result = await run();
 } catch (error) {
   result = { error: error.message };
-  if (process.argv[6] === 'sldprt') {
+  if (process.argv[5] === 'sldprt') {
     try {
       const metadata = JSON.parse(await readFile(process.argv[2] + '.json', 'utf8'));
       result.configurations = metadata.configurations;

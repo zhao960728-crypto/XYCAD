@@ -9,17 +9,12 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { finished, pipeline } from 'node:stream/promises';
-import { MiB, formatHints, meshExtensions, uploadExtensions, uploadHint } from './public/cad-limits.mjs';
-import { explainPreview } from './src/preview-diagnostics.mjs';
-import { bdycOrigin, openBdycSource } from './src/bdyc-source.mjs';
-import { solidWorksNative } from './src/solidworks-native.mjs';
-import { embeddedScope } from './src/embedded-access.mjs';
+import { MiB, formatHints, meshExtensions, uploadHint } from './public/cad-limits.mjs';
 
 const types = new Map([
   ['/index.html', 'text/html; charset=utf-8'],
   ['/style.css', 'text/css; charset=utf-8'],
   ['/viewer.mjs', 'text/javascript; charset=utf-8'],
-  ['/host-tools.mjs', 'text/javascript; charset=utf-8'],
   ['/drawing-buffer.mjs', 'text/javascript; charset=utf-8'],
   ['/mesh-viewer.mjs', 'text/javascript; charset=utf-8'],
   ['/assembly-viewer.mjs', 'text/javascript; charset=utf-8'],
@@ -31,26 +26,13 @@ const types = new Map([
 
 const host = process.env.XYCAD_HOST || '127.0.0.1';
 const port = Number(process.env.XYCAD_PORT ?? 4173);
-const bdyc = bdycOrigin(process.env.XYCAD_BDYC_ORIGIN);
-const converter = process.env.XYCAD_DWG_CONVERTER;
-const embeddedToken = process.env.XYCAD_HOST_TOKEN || '';
-if (embeddedToken && !/^[a-f0-9]{64}$/.test(embeddedToken)) throw new Error('无效的宿主接口配置。');
-if (converter && !isAbsolute(converter)) throw new Error('XYCAD_DWG_CONVERTER 必须是服务端 ES 模块的绝对路径。');
 const sldprtParser = process.env.XYCAD_SLDPRT_PARSER_DIR;
 if (sldprtParser && !isAbsolute(sldprtParser)) throw new Error('XYCAD_SLDPRT_PARSER_DIR 必须是离线解析器目录的绝对路径。');
 const sldprtPython = process.env.XYCAD_SLDPRT_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 const sldprtScript = fileURLToPath(new URL('./scripts/sldprt-offline.py', import.meta.url));
 const run = promisify(execFile);
 const sldprtMaxBytes = 64 * MiB;
-const diagnosticKey = process.env.XYCAD_OPENAI_API_KEY?.trim();
-const diagnosticModel = process.env.XYCAD_OPENAI_MODEL?.trim();
 const workerEnvironment = { ...process.env };
-delete workerEnvironment.XYCAD_OPENAI_API_KEY;
-const loopbackHosts = ['127.0.0.1', 'localhost', '::1'];
-const solidWorksEnabled = process.platform === 'win32' && loopbackHosts.includes(host) &&
-  process.env.XYCAD_SOLIDWORKS === '1';
-let solidWorksActive = false;
-let diagnosticActive = false;
 const slots = Math.min(4, Math.max(1, availableParallelism() - 1));
 const largeDrawingThreshold = 4 * MiB;
 let active = 0;
@@ -83,65 +65,10 @@ function json(response, status, data) {
   response.end(JSON.stringify(data));
 }
 
-async function previewDiagnostics(request, response, query) {
-  const localPort = request.socket.localPort;
-  const localHost = ['127.0.0.1', 'localhost', '[::1]'].some(name => request.headers.host === name + ':' + localPort);
-  const enabled = Boolean(localHost && loopbackHosts.includes(host) && diagnosticKey && diagnosticModel);
-  if (request.method === 'GET') return json(response, 200, { enabled });
-  if (request.method !== 'POST') return response.writeHead(405, { Allow: 'GET, POST' }).end();
-  if (!enabled) return json(response, 404, { error: '本机预览诊断未启用。' });
-  if (request.headers.origin !== 'http://' + request.headers.host ||
-      request.headers['sec-fetch-site'] === 'cross-site') {
-    return json(response, 403, { error: '请在本机 XYCAD 页面发起诊断。' });
-  }
-  if (request.headers['transfer-encoding'] || Number(request.headers['content-length'] ?? 0) !== 0) {
-    response.setHeader('Connection', 'close');
-    return json(response, 400, { error: '诊断接口只接收格式和状态参数。' });
-  }
-  const params = new URLSearchParams(query);
-  const format = params.get('format'), status = params.get('status');
-  if (params.size !== 2 || !uploadExtensions.includes(format) || !['failed', 'partial'].includes(status)) {
-    return json(response, 400, { error: '无效的预览诊断参数。' });
-  }
-  if (diagnosticActive) return json(response, 429, { error: '已有诊断请求正在处理。' });
-  diagnosticActive = true;
-  const cancelled = new AbortController();
-  const cancel = () => cancelled.abort();
-  response.once('close', cancel);
-  try {
-    const signal = AbortSignal.any([cancelled.signal, AbortSignal.timeout(45_000)]);
-    const result = await explainPreview({ format, status, model: diagnosticModel, apiKey: diagnosticKey, signal });
-    return json(response, result.error ? 502 : 200, result);
-  } catch {
-    return json(response, 502, { error: '请求官方 API 失败或超时。' });
-  } finally {
-    response.removeListener('close', cancel);
-    diagnosticActive = false;
-  }
-}
-
 const downloads = {
   D: ['application/dxf', 'xycad.dxf'],
   P: ['application/pdf', 'xycad.pdf'],
-  Z: ['application/zip', 'xycad-sheets.zip'],
-  S: ['application/step', 'xycad.step'],
 };
-
-async function nativeDrawing(file, response, operation) {
-  const timer = setTimeout(() => json(response, 504, { error: 'SOLIDWORKS 仍在处理，结束后可重试。' }), 300_000);
-  try {
-    const result = await solidWorksNative(file, operation, workerEnvironment);
-    if (response.writableEnded || response.destroyed) return;
-    if (!result.chunks) return json(response, 200, result);
-    const [type, filename] = downloads[result.kind];
-    response.writeHead(200, { 'Content-Type': type, 'Content-Disposition': 'attachment; filename="' + filename + '"',
-      'Cache-Control': 'no-store' });
-    await pipeline(Readable.from(result.chunks), response);
-  } catch (error) {
-    if (!response.headersSent) json(response, 422, { error: error.message });
-    else if (!response.writableEnded) response.destroy();
-  } finally { clearTimeout(timer); }
-}
 
 function partDetails(stdout) {
   const data = JSON.parse(stdout);
@@ -209,7 +136,7 @@ function previewInProcess(file, length, response, operation, largeDrawing, block
       : largeDrawing ? Math.min(300, 60 + Math.floor(length / (16 * MiB))) : parasolid ? 60 : 30;
     const child = spawn(process.execPath, [`--max-old-space-size=${largeDrawing ? 2048 : 768}`,
       fileURLToPath(new URL('./src/dxf-job.mjs', import.meta.url)), file,
-      operation, converter ?? '', block, formatHint ?? '', part, hidden, front, asset?.directory ?? '', asset?.id ?? ''],
+      operation, block, formatHint ?? '', part, hidden, front, asset?.directory ?? '', asset?.id ?? ''],
     { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, env: workerEnvironment });
     let failure;
     const timeout = setTimeout(() => {
@@ -258,7 +185,6 @@ function previewInProcess(file, length, response, operation, largeDrawing, block
 }
 
 async function preview(request, response, operation, block, part, hidden, front) {
-  const native = operation.startsWith('native-');
   const requestedFormat = request.headers['x-xycad-format'];
   const projection = operation.startsWith('projection');
   const hints = projection ? meshExtensions : operation === 'preview' && !block ? formatHints : [];
@@ -275,7 +201,7 @@ async function preview(request, response, operation, block, part, hidden, front)
     return rejectUpload(400, '无效的零件配置编号。');
   }
   const emptyMessage = sldprt ? '请选择非空 SLDPRT 零件。' : operation === 'preview' ? `请选择非空图纸。支持 ${uploadHint}。`
-    : projection ? '请选择非空三维模型。' : operation === 'native-step' ? '请选择非空 SLDPRT 零件。'
+    : projection ? '请选择非空三维模型。'
       : `请选择非空 ${operation === 'convert' ? 'DWG/DWT' : 'SLDDRW'} 图纸。`;
   if (request.headers['content-type'] !== 'application/octet-stream') {
     return rejectUpload(415, '请发送 CAD 图纸原始字节。');
@@ -288,8 +214,6 @@ async function preview(request, response, operation, block, part, hidden, front)
   if (active >= slots) {
     return rejectUpload(503, '预览服务正在处理其他图纸，请稍后重试。');
   }
-  if (native && solidWorksActive) return rejectUpload(503, 'SOLIDWORKS 本机接口正在处理另一个文件。');
-  if (native) solidWorksActive = true;
   active++;
   let directory, file, convertedFile, asset, ownsLargeSlot = false;
   async function cleanupUpload() {
@@ -313,7 +237,6 @@ async function preview(request, response, operation, block, part, hidden, front)
       return !length ? rejectUpload(400, emptyMessage) : rejectUpload(503, '服务正在处理另一份大图，请稍后重试。');
     }
     if (largeDrawing) largeDrawingActive = ownsLargeSlot = true;
-    if (native) return await nativeDrawing(file, response, operation.slice(7));
     if (sldprt) {
       convertedFile = join(directory, 'model.step');
       if (!await offlinePart(file, convertedFile, response, configuration)) return;
@@ -326,7 +249,7 @@ async function preview(request, response, operation, block, part, hidden, front)
         if (!idle) return json(response, 503, { error: '装配预览缓存正在使用，请稍后重试。' });
         void releaseAssembly(...idle);
       }
-      asset = { id: randomUUID(), users: 1, owner: request.xycadScope };
+      asset = { id: randomUUID(), users: 1 };
       assemblyAssets.set(asset.id, asset);
       asset.directory = await mkdtemp(join(tmpdir(), 'xycad-assembly-'));
     }
@@ -356,7 +279,6 @@ async function preview(request, response, operation, block, part, hidden, front)
     await cleanupUpload();
     if (asset) await releaseAssembly(asset.id, asset);
     if (ownsLargeSlot) largeDrawingActive = false;
-    if (native) solidWorksActive = false;
     active--;
   }
 }
@@ -364,7 +286,7 @@ async function preview(request, response, operation, block, part, hidden, front)
 async function assemblyResource(request, response, id, resource, query) {
   if (request.method !== 'GET') return response.writeHead(405, { Allow: 'GET' }).end();
   const asset = assemblyAssets.get(id);
-  if (!asset?.expires || asset.expires <= Date.now() || asset.owner !== request.xycadScope) return json(response, 404, { error: '装配预览已过期，请重新打开原文件。' });
+  if (!asset?.expires || asset.expires <= Date.now()) return json(response, 404, { error: '装配预览已过期，请重新打开原文件。' });
   const params = new URLSearchParams(query);
   asset.users++;
   asset.expires = Date.now() + assemblyTtl;
@@ -408,30 +330,12 @@ async function assemblyResource(request, response, id, resource, query) {
 }
 
 const server = createServer({ requestTimeout: 0, headersTimeout: 10000, connectionsCheckingInterval: 1000 }, async (request, response) => {
-  request.xycadScope = embeddedScope(request.headers, embeddedToken);
-  if (request.xycadScope === null) return json(response, 403, { error: '请通过已登录的宿主站点打开预览。' });
   response.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src data: blob:; base-uri 'none'; frame-ancestors 'none'");
   response.setHeader('X-Content-Type-Options', 'nosniff');
   response.setHeader('Referrer-Policy', 'no-referrer');
   const [route, query] = request.url.split('?', 2);
   const assembly = /^\/api\/assembly\/([0-9a-f-]{36})\/(mesh|projection)$/.exec(route);
   if (assembly) return assemblyResource(request, response, assembly[1], assembly[2], query);
-  if (route === '/api/bdyc-file') return openBdycSource(request, response, query, loopbackHosts.includes(host) ? bdyc : null, json);
-  if (route === '/api/preview-diagnostics') return previewDiagnostics(request, response, query);
-  if (route === '/api/solidworks') {
-    const local = solidWorksEnabled && ['127.0.0.1', 'localhost', '[::1]']
-      .some(name => request.headers.host === name + ':' + request.socket.localPort);
-    if (request.method === 'GET') return json(response, 200, { enabled: local });
-    if (request.method !== 'POST') return response.writeHead(405, { Allow: 'GET, POST' }).end();
-    if (!local) return json(response, 404, { error: 'SOLIDWORKS 本机接口未启用。' });
-    if (request.headers.origin !== 'http://' + request.headers.host) {
-      return json(response, 403, { error: '请在本机 XYCAD 页面调用 SOLIDWORKS。' });
-    }
-    const format = new URLSearchParams(query).get('format');
-    if (!['preview', 'dxf', 'pdf', 'step'].includes(format)) return json(response, 400, { error: '请选择预览、DXF、PDF 或 STEP。' });
-    request.setTimeout(120000, () => request.destroy());
-    return preview(request, response, 'native-' + format);
-  }
   const partProjection = route === '/api/projection/part';
   if (route === '/api/preview' || route === '/api/convert' || route === '/api/export' || route === '/api/projection' || partProjection) {
     if (request.method === 'POST') {
@@ -488,12 +392,3 @@ server.listen(port, host, () => {
   const address = host.includes(':') ? `[${host}]` : host;
   console.log(`XYCAD  http://${address}:${server.address().port}/`);
 });
-
-if (embeddedToken && process.connected) {
-  process.once('disconnect', async () => {
-    server.closeAllConnections();
-    server.close();
-    await Promise.all([...assemblyAssets].map(([id, asset]) => releaseAssembly(id, asset))).catch(() => {});
-    process.exit(0);
-  });
-}
