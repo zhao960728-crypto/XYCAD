@@ -4,7 +4,7 @@ import math
 import re
 
 
-def precise_mapper(base, geometry, number):
+def precise_mapper(base, geometry, number, allow_approximation=False):
     class Mapper(base):
         def __init__(self, *args):
             super().__init__(*args)
@@ -22,6 +22,8 @@ def precise_mapper(base, geometry, number):
                             self.edge_surfaces.setdefault(edge.index, {})[surface.index] = surface
 
         def warn(self, key, text):
+            if allow_approximation:
+                return super().warn(key, text)
             # The upload contract accepts complete conversions without approximation warnings.
             raise ValueError("unsupported saved geometry: " + key)
 

@@ -173,9 +173,29 @@ def identity_transforms(model):
     return all(not node.f.get("transform") or node.f["transform"] in valid for node in model.nodes.values())
 
 
+def legacy_thumbnail(raw, target):
+    if not raw.startswith(bytes.fromhex('d0cf11e0a1b11ae1')):
+        return
+    from sldprt2step_lib.container.ole_cfb import OleContainerParser
+    parser = OleContainerParser(raw)
+    images = []
+    for entry in parser.entries:
+        if entry.type != 2 or entry.name not in ('PreviewPNG', 'Preview') or not 0 < entry.size <= 8 * 1024 * 1024:
+            continue
+        stream = parser.extract_stream(entry.name)
+        if not stream:
+            continue
+        data = stream.data
+        if data.startswith(bytes.fromhex('89504e470d0a1a0a')) or data[:4] == b'\x28\x00\x00\x00':
+            images.append(data)
+    if len(images) == 1:
+        Path(str(target) + '.thumbnail').write_bytes(images[0])
+
+
 def main():
     parser, source, target = sys.argv[1:4]
     requested = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+    preview = len(sys.argv) > 5 and sys.argv[5] == 'preview'
     sys.path.insert(0, parser)
     try:
         from sldprt2step_lib.step.convert import _bodies_of
@@ -212,18 +232,24 @@ def main():
         warnings = []
         original = mapper.XtStepMapper
         # Each request runs in its own Python process. Restore the configured mapper after use.
-        mapper.XtStepMapper = precise_mapper(original, geom, mapper.fmt)
+        mapper.XtStepMapper = precise_mapper(original, geom, mapper.fmt, preview)
         try:
             step, solids, faces = mapper.write_step(
                 [(model, body, "Body " + str(index + 1)) for index, body in enumerate(bodies)], "SLDPRT.step", warnings)
         finally:
             mapper.XtStepMapper = original
-        if solids != len(bodies) or not faces or warnings or len(step) > MAX_BYTES:
+        if solids != len(bodies) or not faces or warnings and not preview or len(step) > MAX_BYTES:
             raise ValueError("incomplete or oversized STEP result")
         Path(target).write_bytes(step.encode("ascii"))
         metadata["solidCount"] = solids
+        if warnings:
+            metadata.update(previewOnly=True, approximationWarnings=warnings[:32])
         print(json.dumps(metadata, ensure_ascii=True))
     except Exception as error:
+        try:
+            legacy_thumbnail(raw, target)
+        except Exception:
+            pass
         metadata["reason"] = str(error)[:300]
         print(json.dumps(metadata, ensure_ascii=True))
         return 2

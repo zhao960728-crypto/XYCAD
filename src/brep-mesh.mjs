@@ -35,7 +35,7 @@ export function near(a, b, tolerance) {
   return Math.hypot(...sub(a, b)) <= tolerance;
 }
 
-export function arcPoints(frame, major, minor, from, to, forward, tolerance, closed = false, step = Math.PI / 48) {
+export function arcPoints(frame, major, minor, from, to, forward, tolerance, closed = false, step = Math.PI / 48, lattice = false) {
   requireBrep(major > 0 && minor > 0);
   const angle = p => {
     const [x, y, z] = localPoint(frame, p);
@@ -48,7 +48,13 @@ export function arcPoints(frame, major, minor, from, to, forward, tolerance, clo
     ? turn : ((finish - start) * direction % turn + turn) % turn;
   requireBrep(length > 0);
   const segments = Math.ceil(length / step);
-  const cuts = Array.from({ length: segments - 1 }, (_, i) => length * (i + 1) / segments);
+  const cuts = lattice ? [] : Array.from({ length: segments - 1 }, (_, i) => length * (i + 1) / segments);
+  if(lattice){
+    const fixed=turn/Math.ceil(turn/step);
+    for(let k=Math.floor((start-length)/fixed)-1;k<=Math.ceil((start+length)/fixed)+1;k++){
+      const offset=(k*fixed-start)*direction;if(offset>1e-10&&offset<length-1e-10)cuts.push(offset);
+    }
+  }
   // Keep world-axis extrema so an arc's reported extents do not depend on the sampling phase.
   for (let i = 0; i < 3; i++) {
     const extremum = Math.atan2(minor * frame.y[i], major * frame.x[i]);
@@ -66,6 +72,20 @@ export function arcPoints(frame, major, minor, from, to, forward, tolerance, clo
   }
   points.push(to);
   return points;
+}
+
+// Independent projection sampling: leave the 3D preview tessellation intact.
+// A deterministic circle frame and angular lattice make opposite hole rims
+// coincide even when the source file stores different seam vertices/bases.
+export function projectionArcPoints(frame,major,minor,from,to,forward,tolerance,closed,chord,canonicalClosed=false){
+  if(Math.abs(major-minor)<=Math.max(major,minor)*1e-12){
+    const i=frame.z.reduce((m,v,i)=>Math.abs(v)>Math.abs(frame.z[m])?i:m,0);
+    const normal=frame.z.map(v=>v*Math.sign(frame.z[i]));
+    forward=forward===(dot(frame.z,normal)>0);frame=axes(frame.origin,normal);
+    if(closed&&canonicalClosed){from=worldPoint(frame,major,0,0);to=from;}
+  }
+  const step=Math.max(turn/4096,Math.min(Math.PI/48,2*Math.acos(Math.max(-1,1-chord/Math.max(major,minor)))));
+  return arcPoints(frame,major,minor,from,to,forward,tolerance,closed,step,true);
 }
 
 function nearestAngle(angle, reference) {
@@ -102,8 +122,11 @@ export function joinWindingLoops(loops, winding, tip) {
   const wraps = loops.filter((_, i) => winding[i]);
   const directions = winding.filter(Boolean);
   const hasTip = tip !== undefined;
-  requireBrep(wraps.length === (hasTip ? 1 : 2) && directions.every(value => Math.abs(value) === 1),
-    '回转面的整圈边界超出预览范围。');
+  if(!(wraps.length === (hasTip ? 1 : 2) && directions.every(value => Math.abs(value) === 1))){
+    const error=new Error('回转面的整圈边界超出预览范围。');
+    error.cause={loops,winding,tip};
+    throw error;
+  }
   const holes = loops.filter((_, i) => !winding[i]).map(ring => {
     const angles = ring.map(p => p[1]);
     return { ring, low: Math.min(...angles), high: Math.max(...angles) };
@@ -158,6 +181,25 @@ function projectedLoops(surface, rings, tolerance) {
     return points;
   });
   if (!tips.length && !winding.some(Boolean)) return projected;
+  // A single periodic wire can store both complete circular rims with the
+  // same traversal direction and two opposite copies of its meridian seam.
+  // Its geometry still defines an unambiguous finite band. Recognize only
+  // the two constant-height, full-turn rims; never fill a missing boundary.
+  if(!tips.length&&projected.length===1&&Math.abs(winding[0])===2){
+    const ring=projected[0],lo=Math.min(...ring.map(p=>p[0])),hi=Math.max(...ring.map(p=>p[0]));
+    const groups=[[],[]];let meridians=0,valid=hi-lo>tolerance*2;
+    for(let i=0;i<ring.length;i++){
+      const p=ring[i],q=ring[(i+1)%ring.length],side=Math.abs(p[0]-lo)<=tolerance?0:Math.abs(p[0]-hi)<=tolerance?1:-1;
+      if(side<0){valid=false;break;}groups[side].push(p);
+      if(Math.abs(p[0]-q[0])>tolerance){
+        meridians++;
+        if(Math.abs(nearestAngle(q[1],p[1])-p[1])>1e-7)valid=false;
+      }
+    }
+    const turns=groups.map(points=>points.length>2?Math.round((points.at(-1)[1]-points[0][1])/turn):0);
+    if(valid&&meridians===2&&turns.every(t=>Math.abs(t)===1)&&groups.every(points=>Math.abs(Math.abs(points.at(-1)[1]-points[0][1])-turn)<1e-7))
+      return joinWindingLoops(groups,turns);
+  }
   return joinWindingLoops(projected, winding, tip);
 }
 
@@ -187,14 +229,28 @@ export function* uvTriangles(loops, epsilon, tolerance = epsilon * 1000, splitCr
       edges.push({ y0, y1, x0, x1 });
     }
   }
-  requireBrep(levels.length * edges.length <= 12_000_000, '单个实体面过于复杂。');
+  // A perforated face can have thousands of levels while only a few edges
+  // cross each strip. Sweep endpoint events instead of repeatedly scanning
+  // every edge; charge the budget for work actually performed.
+  edges.forEach((edge, order) => edge.order = order);
+  const starts = [...edges].sort((a, b) => a.y0 - b.y0 || a.order - b.order);
+  let cursor = 0, active = [], visits = 0;
   const xAt = (edge, y) => edge.x0 + (edge.x1 - edge.x0) * Math.max(0, Math.min(1, (y - edge.y0) / (edge.y1 - edge.y0)));
   let count = 0;
   let intersectionChecks = 0;
   for (let i = 1; i < levels.length; i++) {
     const low = levels[i - 1], high = levels[i], mid = (low + high) / 2;
-    const inside = edges.filter(edge => edge.y0 < mid && mid < edge.y1)
-      .map(edge => ({ edge, x: xAt(edge, mid) })).sort((a, b) => a.x - b.x);
+    visits += active.length;
+    active = active.filter(edge => mid < edge.y1);
+    while (cursor < starts.length && starts[cursor].y0 < mid) {
+      const edge = starts[cursor++];
+      visits++;
+      if (mid < edge.y1) active.push(edge);
+    }
+    visits += active.length;
+    requireBrep(visits <= 12_000_000, '单个实体面的扫描超过预览预算。');
+    const inside = active.map(edge => ({ edge, x: xAt(edge, mid) }))
+      .sort((a, b) => a.x - b.x || a.edge.order - b.edge.order);
     requireBrep(inside.length % 2 === 0, '实体面的边界无法闭合。');
     if (splitCrossings) {
       // The order of two linear segments can switch inside a strip.
@@ -210,7 +266,7 @@ export function* uvTriangles(loops, epsilon, tolerance = epsilon * 1000, splitCr
         if (intersection > low + epsilon && intersection < cut - epsilon) cut = intersection;
       }
       if (cut < high) {
-        requireBrep((levels.length + 1) * edges.length <= 12_000_000, '单个实体面过于复杂。');
+        requireBrep(levels.length < 32_768, '实体面的边界交点超过预览预算。');
         levels.splice(i--, 0, cut);
         continue;
       }
@@ -229,9 +285,15 @@ export function* uvTriangles(loops, epsilon, tolerance = epsilon * 1000, splitCr
   requireBrep(count > 0, '实体面的边界没有可预览的面积。');
 }
 
-export function* faceTriangles(surface, rings, tolerance, reverse = false, splitCrossings = false) {
+export function* faceTriangles(surface, rings, tolerance, reverse = false, splitCrossings = false, projectionRings=rings, projectionChord=tolerance) {
+  const planarFace = surface.radius === undefined ? { rings:projectionRings } : undefined;
+  const curvedFace = surface.radius !== undefined ? { rings:projectionRings,normals:projectionRings.map(ring=>ring.map(p=>{
+    const [x,y]=localPoint(surface.frame,p),angle=Math.atan2(y,x);
+    return surface.frame.x.map((v,i)=>v*Math.cos(angle)+surface.frame.y[i]*Math.sin(angle)-surface.frame.z[i]*(surface.slope??0));
+  })) } : undefined;
   requireBrep(rings.length && rings.every(ring => ring.length >= 3 || surface.slope && ring.length === 1));
   const loops = projectedLoops(surface, rings, tolerance);
+  if(curvedFace)curvedFace.surface={frame:surface.frame,radius:surface.radius,slope:surface.slope??0,loops,tolerance,chord:projectionChord};
   const epsilon = surface.radius === undefined ? tolerance * 0.001 : 1e-9;
   const point = ([x, y]) => {
     if (surface.radius === undefined) return worldPoint(surface.frame, x, y, 0);
@@ -239,6 +301,9 @@ export function* faceTriangles(surface, rings, tolerance, reverse = false, split
     return worldPoint(surface.frame, radius * Math.cos(y), radius * Math.sin(y), x);
   };
   for (const [a, b, c] of uvTriangles(loops, epsilon, tolerance, splitCrossings)) {
-    yield (reverse ? [a, c, b] : [a, b, c]).flatMap(point);
+    const triangle = (reverse ? [a, c, b] : [a, b, c]).flatMap(point);
+    if (planarFace) Object.defineProperty(triangle,'planarFace',{value:planarFace});
+    if (curvedFace) Object.defineProperty(triangle,'curvedFace',{value:curvedFace});
+    yield triangle;
   }
 }

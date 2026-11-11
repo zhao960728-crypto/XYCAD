@@ -103,6 +103,16 @@ button.primary:hover { background: #91e8d5; }
 #measure-result.measure-error { color: #ffd5a5; }
 #measure-caption { display: block; margin-top: .15rem; color: var(--muted); font-size: .73rem; }
 .measure-snap { display: flex; align-items: center; gap: .25rem; font-size: .8rem; }
+.weight-panel { display: flex; align-items: center; gap: .55rem 1.3rem; flex-wrap: wrap;
+  padding: .65rem .8rem; border: 1px solid var(--line); border-top: 0; background: var(--panel); }
+.weight-fields { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem .8rem; }
+.weight-fields label { display: flex; align-items: center; gap: .35rem; font-size: .8rem; }
+.weight-fields input, .weight-fields select { padding: .3rem .45rem; border: 1px solid #384457;
+  border-radius: 6px; background: #222a37; color: inherit; font: inherit; }
+.weight-fields input { width: 6rem; }
+#weight-result { color: var(--accent); font-size: .86rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+#weight-note { display: block; margin-top: .2rem; color: var(--muted); font-size: .73rem; }
+#toggle-weight[aria-expanded="true"] { border-color: var(--accent); }
 .measure-snap input { accent-color: var(--accent); }
 #measure-scale { width: 5.2rem; color: inherit; background: #222a37; border: 1px solid #384457; border-radius: 4px; padding: .25rem; }
 #measure-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -148,6 +158,10 @@ polygon.measure-geometry { fill: #ffd16a32; }
 .mesh-tree .mesh-more { margin: .22rem; }
 .projection-hidden { display: flex; align-items: center; gap: .25rem; white-space: nowrap; font-size: .8rem; }
 .projection-hidden input { margin: 0; accent-color: var(--accent); }
+.projection-settings { display:flex; flex-wrap:wrap; align-items:center; gap:.65rem 1rem; padding:.65rem .85rem; border:1px solid var(--line); background:var(--panel); font-size:.8rem; }
+.projection-settings label { display:flex; align-items:center; gap:.35rem; }
+.projection-settings input { width:5.5rem; padding:.45rem; border:1px solid var(--line); border-radius:.3rem; background:#10141b; color:inherit; }
+#projection-layout-info { color:var(--muted); flex:1 1 220px; }
 #drawing text { font-family: "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif; white-space: pre; }
 #drawing .layer-off { display: none; }
 #drawing .wipeout-fill { fill: var(--drawing-background); }
@@ -198,3 +212,9 @@ polygon.measure-geometry { fill: #ffd16a32; }
   .is-3d .sidebar { max-height: 350px; }
   .viewport { height: min(53vh, 570px); min-height: 260px; }
 }
+
+.frame-fields{flex-basis:100%;min-width:0}.frame-fields summary{cursor:pointer}.frame-fields p{font-size:.8rem;color:var(--muted)}.frame-fields>div{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:.5rem}.frame-fields label{display:flex;justify-content:space-between;gap:.4rem}.frame-fields input{width:65%;min-width:0}
+
+#pdf-region-overlay { position:absolute; inset:0; width:100%; height:100%; z-index:4; pointer-events:none; }
+#pdf-region-overlay.picking { pointer-events:auto; cursor:crosshair; touch-action:none; }
+#pdf-region-box { fill:#20a89328; stroke:#5be4c8; stroke-width:1.5; stroke-dasharray:6 4; }

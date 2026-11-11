@@ -122,6 +122,12 @@ function sheetStreams(bytes, vector) {
   return streams;
 }
 
+export function readSolidWorksThumbnail(bytes) {
+  const data=sheetStreams(bytes,false).get('PreviewPNG');
+  const image=data&&readSheetPng(data);
+  return image&&{width:image.width,height:image.height,mime:'image/png',base64:data.toString('base64')};
+}
+
 export function openSolidWorksDrawing(input, expected = false, vector = false) {
   const bytes = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
   if (!hasSolidWorksRecords(bytes)) {

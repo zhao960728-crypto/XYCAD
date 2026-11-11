@@ -1,3 +1,5 @@
+import {addProjectionFrame} from './projection-frame.mjs';
+import {addProjectionDimensions} from './projection-dimensions.mjs';
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { hasDxfHeader, key, name, parseDxf } from './dxf-parser.mjs';
 import { projectionHiddenLayers } from '../public/cad-limits.mjs';
@@ -75,17 +77,23 @@ function solidWorksPreview(bytes, expected) {
       : { sheets, items: [], layers: [], issues: warnings }) };
 }
 
-export async function buildProjection(bytes, formatHint, output, part, hidden = '7', front = 'ny') {
+export async function buildProjection(bytes, formatHint, output, part, hidden = '7', front = 'ny', options = {}) {
   const partPath = part ? part.split('.').map(Number) : undefined;
   const { scene, error } = await buildPreview({ bytes, formatHint, partPath });
   if (!scene?.mesh) return { error: error || '请先打开可预览的三维模型。' };
   if (scene.projectionAvailable === false) return { error: '此节点的装配几何未完整读取，暂不能生成三视图。' };
   if (part && !scene.partLabel) return { error: '此模型没有可选的零件或装配节点。' };
-  return projectMesh(scene, output, part, hidden, front);
+  return projectMesh(scene, output, part, hidden, front, options);
 }
 
-export function projectMesh(scene, output, part, hidden, front) {
-  const drawing = buildOrthographic(scene.mesh, front);
+export function projectMesh(scene, output, part, hidden, front, options = {}) {
+  const drawing = buildOrthographic(scene.mesh, front, options);
+  return renderProjection(scene,drawing,output,part,hidden,front);
+}
+
+export function renderProjection(scene,drawing,output,part,hidden,front,geometry) {
+  addProjectionDimensions(drawing,scene);
+  addProjectionFrame(drawing,scene,part);
   if (hidden !== '7') {
     const excluded = new Set(projectionHiddenLayers.filter((_, index) => !(Number(hidden) & (1 << index))));
     drawing.entities = drawing.entities.filter(entity => !excluded.has(entity.layer));
@@ -96,11 +104,21 @@ export function projectMesh(scene, output, part, hidden, front) {
   const preview = drawingScene(parseDxf(dxf), '');
   const issues = [
     [part ? '三视图只包含所选节点，投影沿用模型 XYZ 轴和该节点的装配姿态。' : '三视图取自完整装配位置。', 1],
-    ['曲线按模型网格分段，尺寸与工艺标注可在 CAD 中另行添加。', 1],
+    ['自动尺寸为原生 CAD 标注；孔径按可识别的圆形内轮廓生成，同心圆只标最内圈。曲线与测量受模型采样精度影响，未识别的孔槽、工艺及公差待核。', 1],
+    ...(drawing.layout.dimensions.views.some(v=>v.holes>24)?[['孔位较密，已保留孔径与外形尺寸，完整孔距链待核。',1]]:[]),
+    ...(geometry?.nativeHiddenLine?[['复杂曲面使用本机 CAD 内核的原始 BREP 计算可见轮廓与隐藏线，显示网格不参与遮挡判断。',1]]:[]),
+    ...(drawing.diagnostics.sourcePlanarFaces?[['平面轮廓与孔采用原模型边界。',1]]:[]),
+    ...(drawing.diagnostics.analyticRevolutionFaces?[['圆柱面与圆锥面使用原曲面计算遮挡及轮廓；其他曲面仍按网格近似。',1]]:[]),
     ...(!drawing.units ? [['源模型未声明长度单位。DXF 保留原坐标单位。', 1]] : []),
     ...scene.issues, ...preview.issues,
   ];
-  return { scene: { ...preview, issues, projection: true, projectionFront: front, format: '三视图 · 第一角法 · 1:1',
+  return { scene: { ...preview, issues, projection: true, projectionFront: front,
+    projectionOptions:drawing.layout.requested,projectionLayout:drawing.layout,
+    projectionGeometry:geometry??{method:'hybrid-boundary-mesh',sourcePlanarFaces:drawing.diagnostics.sourcePlanarFaces,
+      analyticRevolutionFaces:drawing.diagnostics.analyticRevolutionFaces,meshCurvedFaces:drawing.diagnostics.meshCurvedFaces,
+      boundaryChordTargetMm:drawing.diagnostics.boundaryChordTargetMm,
+      meshOnly:!drawing.diagnostics.sourcePlanarFaces&&!drawing.diagnostics.analyticRevolutionFaces},
+    format: '三视图 · 第一角法 · 1:1',
     ...(part && { projectionPart: { path: part, label: scene.partLabel } }) } };
 }
 

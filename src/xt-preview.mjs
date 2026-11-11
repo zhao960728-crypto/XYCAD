@@ -1,5 +1,6 @@
-import { arcPoints, dot, faceTriangles, localPoint, mul, near, requireBrep, sub, worldPoint } from './brep-mesh.mjs';
+import { arcPoints, projectionArcPoints, dot, faceTriangles, localPoint, mul, near, requireBrep, sub, worldPoint } from './brep-mesh.mjs';
 import { buildMeshScene, MeshPartSelectionError } from './mesh-scene.mjs';
+import { mapTriangle, withCurvedBoundary } from './mesh-topology.mjs';
 import { meshLimits } from './cad-budget.mjs';
 import { readXtRecords, verifiedXtAssemblyLinks } from './xt-records.mjs';
 import { xtEncoding } from './xt-wire.mjs';
@@ -84,7 +85,7 @@ function* triangles(nodes, resolution, { evaluationLimit, useSourcePlaneToleranc
     requireBrep(!close, 'Parasolid X_T 半边环未闭合。');
   }
   const point = id => vector(node(node(id, 18).point, 29).position);
-  function curvePoints(geometry, basis, previous, fin, tolerance, anchorTolerances) {
+  function curvePoints(geometry, basis, previous, fin, tolerance, anchorTolerances, projection=false,canonicalClosed=false) {
     const trimmed = geometry.type === 133;
     if (![30, 31, 32, 38, 134, 137].includes(basis.type)) {
       throw new Error('Parasolid X_T 包含暂未适配的边曲线类型 ' + basis.type + '。');
@@ -123,7 +124,8 @@ function* triangles(nodes, resolution, { evaluationLimit, useSourcePlaneToleranc
     const axes = xtFrame(basis), major = basis.major ?? basis.radius, minor = basis.type === 31 ? major : basis.minor;
     start ??= worldPoint(axes, major, 0, 0);
     end ??= start;
-    return arcPoints(axes, major, minor, start, end, forward, tolerance, Boolean(previous.vertex) && previous.vertex === fin.vertex, arcStep);
+    const args=[axes,major,minor,start,end,forward,tolerance,Boolean(previous.vertex)&&previous.vertex===fin.vertex];
+    return projection?projectionArcPoints(...args,faceChord,canonicalClosed):arcPoints(...args,arcStep);
   }
   function loopPoints(loopId, loop, budget) {
     const points = [], tolerances = [], gaps = [];
@@ -151,7 +153,7 @@ function* triangles(nodes, resolution, { evaluationLimit, useSourcePlaneToleranc
       const pointTolerance = Math.min(tolerance, recoverTolerantTrims ? tolerantTrimLimit : budget.plane ? 0.001 : 0.0002);
       budget.tolerance = Math.max(budget.tolerance, pointTolerance);
       const sample = curvePoints(curve, basis, previous, fin, tolerance,
-        recoverTolerantTrims ? anchors.map(value => Math.min(value, tolerantTrimLimit)) : undefined);
+        recoverTolerantTrims ? anchors.map(value => Math.min(value, tolerantTrimLimit)) : undefined,budget.projection,fin.next===id&&fin.previous===id);
       if (budget.plane) requireBrep(sample.every(p => Math.abs(localPoint(budget.plane, p)[2]) <= Math.max(1e-7, pointTolerance)),
         planeBoundary);
       if (recoverTolerantTrims) {
@@ -182,17 +184,23 @@ function* triangles(nodes, resolution, { evaluationLimit, useSourcePlaneToleranc
         loops.push(loopPoints(id, loop, budget));
       }
       const rings = loops.map(loop => loop.points);
+      const projectionLoops=[];
+      for(const [id,loop] of chain(face.loop,15))projectionLoops.push(loopPoints(id,loop,{...budget,projection:true}));
+      const projectionRings=projectionLoops.map(loop=>loop.points);
       if (recoverTolerantTrims && rings.length === 1) {
         if (surface.type === 50 && loops[0].straight && rings[0].length === 2 &&
             rings[0].every(p => Math.abs(localPoint(properties.frame, p)[2]) <= budget.tolerance)) continue;
-        if (surface.type === 51) closeTolerantCylinder(properties, rings[0], loops[0].gaps);
+        if (surface.type === 51) {
+          closeTolerantCylinder(properties, rings[0], loops[0].gaps);
+          closeTolerantCylinder(properties, projectionRings[0], projectionLoops[0].gaps);
+        }
       }
       const reverse = face.sense !== surface.sense;
-      if (properties.inverse) yield* parametricFace(properties, rings, budget.tolerance, faceChord, reverse,
-        recoverTolerantTrims ? loops.map(loop => loop.tolerances) : undefined);
-      else if (surface.type === 53) yield* xtSphericalFace(properties.frame.origin, properties.radius, rings, budget.tolerance, faceChord, reverse);
-      else if (properties.kind === 54) yield* torusFace(properties.frame, properties.major, properties.radius, rings, budget.tolerance, faceChord, reverse);
-      else yield* faceTriangles(properties, rings, budget.tolerance, reverse, recoverTolerantTrims);
+      if (properties.inverse) yield* withCurvedBoundary(parametricFace(properties, rings, budget.tolerance, faceChord, reverse,
+        recoverTolerantTrims ? loops.map(loop => loop.tolerances) : undefined),projectionRings);
+      else if (surface.type === 53) yield* withCurvedBoundary(xtSphericalFace(properties.frame.origin, properties.radius, rings, budget.tolerance, faceChord, reverse),projectionRings);
+      else if (properties.kind === 54) yield* withCurvedBoundary(torusFace(properties.frame, properties.major, properties.radius, rings, budget.tolerance, faceChord, reverse),projectionRings);
+      else yield* faceTriangles(properties, rings, budget.tolerance, reverse, recoverTolerantTrims,projectionRings,faceChord);
     }
   }
   function transform(id, parent) {
@@ -225,10 +233,12 @@ function* triangles(nodes, resolution, { evaluationLimit, useSourcePlaneToleranc
       yield null;
     } else if (part.type === 12) {
       const label = '零件 ' + id + suffix;
-      const place = triangle => [0, 3, 6].flatMap(start => mul(placement(triangle.slice(start, start + 3)), 1000));
+      const placedFaces = new WeakMap();
+      const place = triangle => mapTriangle(triangle, p => mul(placement(p), 1000), placedFaces);
       if (shared) {
         yield { label, key: id, definition: id, geometry: function* () {
-          for (const triangle of body(id)) yield triangle.map(value => value * 1000);
+          const faces = new WeakMap();
+          for (const triangle of body(id)) yield mapTriangle(triangle, p => p.map(value => value * 1000), faces);
         }, placement: point => mul(placement(mul(point, 0.001)), 1000), keepEmpty: true };
       } else if (missingParts) {
         // Commit a body's geometry only once all its faces have been read.

@@ -16,9 +16,58 @@ export function writeVectorDxf({ entities, units = 4, hiddenDash }) {
   const spaces = [['10', '*Model_Space'], ['11', '*Paper_Space']];
   const layers = ['0', ...new Set(entities.map(entity => entity.layer))];
   const hex = value => value.toString(16).toUpperCase();
+  let nextHandle=0x100+layers.length;
+  const handle=()=>hex(nextHandle++);
+  const dimensions=entities.filter(e=>e.type==='DIMENSION').map((entity,i)=>({entity,name:'*D'+(i+1),record:handle()}));
+  const dimensionByEntity=new Map(dimensions.map(d=>[d.entity,d]));
+  const dimensionHeight=dimensions[0]?.entity.height??2.5;
+  function writeEntity(entity,owner='10') {
+      const { type, layer, a } = entity;
+      emit(0, type, 5, handle(), 330, owner, 100, 'AcDbEntity', 8, layer);
+      if (entity.color !== undefined) emit(420, entity.color);
+      const xyz = (code, [x,y]) => emit(code,x,code+10,y,code+20,0);
+      switch (type) {
+        case 'LINE':
+          emit(100, 'AcDbLine');
+          xyz(10, a);
+          xyz(11, entity.b);
+          break;
+        case 'CIRCLE':
+        case 'ARC':
+          emit(100, 'AcDbCircle');
+          xyz(10, a);
+          emit(40, entity.radius);
+          if (type === 'ARC') emit(100, 'AcDbArc', 50, entity.angles[0], 51, entity.angles[1]);
+          break;
+        case 'LWPOLYLINE':
+          emit(100, 'AcDbPolyline', 90, entity.vertices.length, 70, (entity.closed ? 1 : 0) | (entity.patternContinuous ? 128 : 0));
+          for (const [x, y] of entity.vertices) emit(10, x, 20, y);
+          break;
+        case 'SOLID':
+          emit(100, 'AcDbTrace');
+          for (const [j, point] of entity.vertices.entries()) xyz(10 + j, point);
+          xyz(13, entity.vertices[2]);
+          break;
+        case 'TEXT':
+          emit(100, 'AcDbText');
+          xyz(10, a);
+          emit(40, entity.height, 1, entity.value, 50, entity.angle, 41, entity.width, 7, 'Standard', 100, 'AcDbText');
+          break;
+        case 'DIMENSION': {
+          const d=dimensionByEntity.get(entity),diameter=entity.kind==='diameter';
+          emit(100,'AcDbDimension',280,0,2,d.name);xyz(10,entity.base);xyz(11,entity.textPoint);
+          emit(70,32+128+(diameter?3:0),71,5,1,'<>',3,'XYCAD_DIM',42,entity.measurement);
+          if(diameter){emit(100,'AcDbDiametricDimension');xyz(15,entity.b);emit(40,entity.leaderLength??0);}
+          else{emit(100,'AcDbAlignedDimension');xyz(13,entity.a);xyz(14,entity.b);emit(50,entity.angle,100,'AcDbRotatedDimension');}
+          break;
+        }
+        default:throw Error('含无法写入 DXF 的图元。');
+}
+  }
   section('HEADER', () => {
-    emit(9, '$ACADVER', 1, 'AC1032', 9, '$HANDSEED', 5, hex(0x50 + layers.length + entities.length),
-      9, '$INSUNITS', 70, units, 9, '$PSTYLEMODE', 290, 1);
+    emit(9, '$ACADVER', 1, 'AC1032', 9, '$HANDSEED', 5, '7FFFFFFF',
+      9, '$INSUNITS', 70, units, 9, '$PSTYLEMODE', 290, 1,
+      ...(dimensions.length?[9,'$DIMSTYLE',2,'XYCAD_DIM',9,'$DIMASSOC',280,1]:[]));
   });
   section('TABLES', () => {
     table('VPORT', '9', 0, () => {});
@@ -34,7 +83,7 @@ export function writeVectorDxf({ entities, units = 4, hiddenDash }) {
     table('LAYER', '4', layers.length, () => {
       for (const [i, name] of layers.entries()) {
         emit(0, 'LAYER', 5, hex(0x40 + i), 330, '4', 100, 'AcDbSymbolTableRecord', 100, 'AcDbLayerTableRecord',
-          2, name, 70, 0, 62, 7, 6, hiddenDash && name.endsWith('-HIDDEN') ? 'HIDDEN' : 'Continuous', 370, -3, 390, '38');
+          2, name, 70, 0, 62, ({TEXT:3,KEY_INFO:2,DIM:4}[name]??7), 6, hiddenDash && name.endsWith('-HIDDEN') ? 'HIDDEN' : 'Continuous', 370, -3, 390, '38');
       }
     });
     table('STYLE', 'A', 1, () => {
@@ -47,10 +96,16 @@ export function writeVectorDxf({ entities, units = 4, hiddenDash }) {
       emit(0, 'APPID', 5, '8', 330, '7', 100, 'AcDbSymbolTableRecord', 100, 'AcDbRegAppTableRecord',
         2, 'ACAD', 70, 0);
     });
-    table('DIMSTYLE', '12', 0, () => emit(100, 'AcDbDimStyleTable', 71, 0));
-    table('BLOCK_RECORD', '6', spaces.length, () => {
+    table('DIMSTYLE', '12', 1, () => {
+      emit(100,'AcDbDimStyleTable',71,1);
+      emit(0,'DIMSTYLE',105,'15',330,'12',100,'AcDbSymbolTableRecord',100,'AcDbDimStyleTableRecord',2,'XYCAD_DIM',70,0,
+        40,1,41,dimensionHeight*.65,42,dimensionHeight*.2,44,dimensionHeight*.4,
+        140,dimensionHeight,147,dimensionHeight*.3,77,1,78,8,271,3,278,46,340,'B');
+    });
+    table('BLOCK_RECORD', '6', spaces.length+dimensions.length, () => {
       for (const [handle, name] of spaces) emit(0, 'BLOCK_RECORD', 5, handle, 330, '6',
         100, 'AcDbSymbolTableRecord', 100, 'AcDbBlockTableRecord', 2, name, 70, 0, 280, 1, 281, 0);
+      for(const d of dimensions)emit(0,'BLOCK_RECORD',5,d.record,330,'6',100,'AcDbSymbolTableRecord',100,'AcDbBlockTableRecord',2,d.name,70,0,280,1,281,0);
     });
   });
   section('BLOCKS', () => {
@@ -59,45 +114,13 @@ export function writeVectorDxf({ entities, units = 4, hiddenDash }) {
         100, 'AcDbBlockBegin', 2, name, 70, 0, 10, 0, 20, 0, 30, 0, 3, name, 1, '');
       emit(0, 'ENDBLK', 5, (33 + 2 * i).toString(16), 330, owner, 100, 'AcDbEntity', 8, '0', 100, 'AcDbBlockEnd');
     }
-  });
-  section('ENTITIES', () => {
-    const xyz = (code, [x, y]) => emit(code, x, code + 10, y, code + 20, 0);
-    for (const [i, entity] of entities.entries()) {
-      const { type, layer, a } = entity;
-      emit(0, type, 5, hex(0x40 + layers.length + i), 330, '10', 100, 'AcDbEntity', 8, layer);
-      if (entity.color !== undefined) emit(420, entity.color);
-      switch (type) {
-        case 'LINE':
-          emit(100, 'AcDbLine');
-          xyz(10, a);
-          xyz(11, entity.b);
-          break;
-        case 'CIRCLE':
-        case 'ARC':
-          emit(100, 'AcDbCircle');
-          xyz(10, a);
-          emit(40, entity.radius);
-          if (type === 'ARC') emit(100, 'AcDbArc', 50, entity.angles[0], 51, entity.angles[1]);
-          break;
-        case 'LWPOLYLINE':
-          emit(100, 'AcDbPolyline', 90, entity.vertices.length, 70, 0);
-          for (const [x, y] of entity.vertices) emit(10, x, 20, y);
-          break;
-        case 'SOLID':
-          emit(100, 'AcDbTrace');
-          for (const [j, point] of entity.vertices.entries()) xyz(10 + j, point);
-          xyz(13, entity.vertices[2]);
-          break;
-        case 'TEXT':
-          emit(100, 'AcDbText');
-          xyz(10, a);
-          emit(40, entity.height, 1, entity.value, 50, entity.angle, 41, entity.width, 7, 'Standard', 100, 'AcDbText');
-          break;
-        default:
-          throw new Error('含无法写入 DXF 的图元。');
-      }
+    for(const d of dimensions){
+      emit(0,'BLOCK',5,handle(),330,d.record,100,'AcDbEntity',8,'DIM',100,'AcDbBlockBegin',2,d.name,70,1,10,0,20,0,30,0,3,d.name,1,'');
+      for(const entity of d.entity.graphics)writeEntity(entity,d.record);
+      emit(0,'ENDBLK',5,handle(),330,d.record,100,'AcDbEntity',8,'DIM',100,'AcDbBlockEnd');
     }
   });
+  section('ENTITIES', () => { for(const entity of entities)writeEntity(entity); });
   section('OBJECTS', () => {
     emit(0, 'DICTIONARY', 5, '31', 330, '0', 100, 'AcDbDictionary', 281, 1,
       3, 'ACAD_PLOTSTYLENAME', 350, '37');

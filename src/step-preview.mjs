@@ -1,6 +1,7 @@
 import { isStep, readPart21 } from './step-part21.mjs';
 import { buildMeshScene, meshLabel } from './mesh-scene.mjs';
-import { arcPoints, axes, cross, faceTriangles, localPoint, mul, near, requireBrep, sub, worldPoint } from './brep-mesh.mjs';
+import { mapTriangle, withCurvedBoundary } from './mesh-topology.mjs';
+import { arcPoints, projectionArcPoints, axes, cross, faceTriangles, localPoint, mul, near, requireBrep, sub, worldPoint } from './brep-mesh.mjs';
 import { splineAxis, splineEdge } from './spline-basis.mjs';
 import { parametricFace } from './parametric-face.mjs';
 import { stepSplineSurface } from './step-surfaces.mjs';
@@ -90,7 +91,7 @@ function* triangles(records, stats, shared = false) {
     splines.set(curve, result);
     return result;
   }
-  function edgePoints(id, units) {
+  function edgePoints(id, units,canonicalClosed=false) {
     const { tolerance } = units;
     const [, , , edgeId, sense] = record(id, 'ORIENTED_EDGE').args;
     const [, start, end, curveId, forward] = record(edgeId, 'EDGE_CURVE').args;
@@ -101,7 +102,8 @@ function* triangles(records, stats, shared = false) {
     if (curve.type === 'LINE') return [from, to];
     if (curve.type === 'CIRCLE' || curve.type === 'ELLIPSE') {
       const [, basis, major, minor] = curve.args;
-      return arcPoints(frame(basis), major, curve.type === 'CIRCLE' ? major : minor, from, to, direct === flag(forward), tolerance, start === end);
+      const args=[frame(basis), major, curve.type === 'CIRCLE' ? major : minor, from, to, direct === flag(forward), tolerance, start === end];
+      return units.projection?projectionArcPoints(...args,units.chord,canonicalClosed):arcPoints(...args);
     }
     if (curve.type === 'B_SPLINE_CURVE_WITH_KNOTS' || curve.components?.has('B_SPLINE_CURVE_WITH_KNOTS')) {
       const { axis, evaluate } = spline(curve);
@@ -120,8 +122,9 @@ function* triangles(records, stats, shared = false) {
     else {
       requireBrep(loop.type === 'EDGE_LOOP', 'STEP 包含暂未适配的面边界。');
       ring = [];
-      for (const edge of refs(loop.args[1])) {
-        const points = edgePoints(edge, units);
+      const edges=refs(loop.args[1]);
+      for (const edge of edges) {
+        const points = edgePoints(edge, units,edges.length===1);
         if (ring.length) requireBrep(near(ring.at(-1), points[0], tolerance), 'STEP 边界的相邻边未连接。');
         ring.push(...(ring.length ? points.slice(1) : points));
         requireBrep(ring.length <= 16_384, 'STEP 单个环超过预览容量。');
@@ -136,13 +139,14 @@ function* triangles(records, stats, shared = false) {
     requireBrep(['FACE', 'FACE_SURFACE', 'ADVANCED_FACE'].includes(entity.type), 'STEP 包含暂未适配的面类型。');
     const [, bounds, surfaceId, sense] = entity.args;
     const rings = refs(bounds).map(bound => boundary(bound, units));
+    const projectionRings=refs(bounds).map(bound=>boundary(bound,{...units,projection:true}));
     requireBrep(rings[0]?.length >= 3);
     if (entity.type === 'FACE') {
       const [origin, second, ...rest] = rings[0];
       const x = sub(second, origin);
       const normal = rest.map(p => cross(x, sub(p, origin))).find(v => Math.hypot(...v) > units.tolerance ** 2);
       requireBrep(normal);
-      yield* faceTriangles({ frame: axes(origin, normal, x) }, rings, units.tolerance);
+      yield* faceTriangles({ frame: axes(origin, normal, x) }, rings, units.tolerance,false,false,projectionRings);
       return;
     }
     const surface = record(surfaceId);
@@ -151,11 +155,11 @@ function* triangles(records, stats, shared = false) {
     const { chord, tolerance } = units;
     if (surface.type === 'B_SPLINE_SURFACE_WITH_KNOTS' || surface.components?.has('B_SPLINE_SURFACE_WITH_KNOTS')) {
       // The exported edge and surface can be separate approximations of the same boundary.
-      yield* parametricFace(stepSplineSurface(surface, point), rings, Math.max(tolerance, chord), chord, reverse);
+      yield* withCurvedBoundary(parametricFace(stepSplineSurface(surface, point), rings, Math.max(tolerance, chord), chord, reverse),projectionRings);
       return;
     }
     if (surface.type === 'TOROIDAL_SURFACE') {
-      yield* torusFace(frame(basis), radius, semiAngle, rings, tolerance, chord, reverse);
+      yield* withCurvedBoundary(torusFace(frame(basis), radius, semiAngle, rings, tolerance, chord, reverse),projectionRings);
       return;
     }
     requireBrep(['PLANE', 'CYLINDRICAL_SURFACE', 'CONICAL_SURFACE'].includes(surface.type),
@@ -163,7 +167,7 @@ function* triangles(records, stats, shared = false) {
     const slope = surface.type === 'CONICAL_SURFACE' ? Math.tan(semiAngle * units.angle) : 0;
     requireBrep(Number.isFinite(slope) && (surface.type === 'PLANE' || typeof radius === 'number' && radius >= 0));
     const properties = surface.type === 'PLANE' ? { frame: frame(basis) } : { frame: frame(basis), radius, slope };
-    yield* faceTriangles(properties, rings, tolerance, reverse);
+    yield* faceTriangles(properties, rings, tolerance, reverse,false,projectionRings,chord);
   }
   function* shell(id, units) {
     const entity = record(id);
@@ -284,13 +288,15 @@ function* triangles(records, stats, shared = false) {
       const bodyName = meshLabel(record(child).args?.[0]?.text);
       const marker = { label: (group ? bodyName : label || bodyName) || (group ? '实体 ' : '零件 ') + child, key: child };
       const geometry = function* () {
-        for (const triangle of item(child, settings)) yield triangle.map(value => value * settings.length);
+        const faces = new WeakMap();
+        for (const triangle of item(child, settings)) yield mapTriangle(triangle, p => p.map(value => value * settings.length), faces);
       };
       if (shared) {
         yield { ...marker, definition: child + ':' + shape.contextId, geometry, placement: mapPoint, keepEmpty: true };
       } else {
         yield marker;
-        for (const triangle of geometry()) yield [0, 3, 6].flatMap(start => mapPoint(triangle.slice(start, start + 3)));
+        const faces = new WeakMap();
+        for (const triangle of geometry()) yield mapTriangle(triangle, mapPoint, faces);
       }
       yield null;
     }

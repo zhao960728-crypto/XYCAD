@@ -18,7 +18,11 @@
         <button class="primary" id="open" type="button">打开图纸</button>
         <input id="file" type="file" hidden>
         <button id="sample" type="button">查看样图</button>
+        <button id="cancel-load" type="button" hidden>取消载入</button>
         <button id="download" type="button" hidden>下载 DXF</button>
+        <button id="download-pdf" type="button" title="导出当前可见图层或框选范围" hidden>转 PDF</button>
+        <button id="pick-pdf-region" type="button" aria-pressed="false" hidden>框选 PDF 范围</button>
+        <button id="clear-pdf-region" type="button" hidden>清除 PDF 范围</button><select id="drawing-pdf-paper" aria-label="转 PDF 纸张" hidden><option value="a4">A4</option><option value="a3">A3</option></select>
         <button id="make-projection" type="button" hidden>生成三视图</button>
         <button id="back-to-mesh" type="button" hidden>返回三维</button>
         <div id="projection-export" class="sheet-export" hidden>
@@ -42,14 +46,7 @@
       </div>
       <div class="tools view-tools">
         <select id="measure-mode" aria-label="测量工具" hidden><option value="">测量</option></select>
-        <select id="projection-front" aria-label="三视图主视方向" title="从所选方向看向模型" hidden>
-          <option value="ny">主视方向 −Y</option>
-          <option value="py">主视方向 +Y</option>
-          <option value="nx">主视方向 −X</option>
-          <option value="px">主视方向 +X</option>
-          <option value="nz">主视方向 −Z</option>
-          <option value="pz">主视方向 +Z</option>
-        </select>
+        <button id="toggle-weight" type="button" aria-controls="weight-panel" aria-expanded="false" hidden>材质 / 重量</button>
         <select id="mesh-view" aria-label="三维视角" hidden>
           <option value="iso">等轴测</option>
           <option value="front">正视</option>
@@ -61,6 +58,57 @@
         <button id="in" type="button" aria-label="放大" disabled>+</button>
         <button id="fit" type="button" disabled>适合窗口</button>
       </div>
+    </div>
+    <section id="weight-panel" class="weight-panel" aria-label="材质和重量" hidden>
+      <div class="weight-fields">
+        <label>材质
+          <select id="weight-material">
+            <option value="">请选择</option>
+            <option value="8.96">紫铜</option>
+            <option value="2.70">铝材</option>
+            <option value="7.85">碳钢</option>
+            <option value="7.90">304 不锈钢</option>
+            <option value="8.50">H62 黄铜</option>
+            <option value="custom">自定义</option>
+          </select>
+        </label>
+        <label id="weight-density-field" hidden>密度 (g/cm³)
+          <input id="weight-density" type="number" min="0" step="any" inputmode="decimal">
+        </label>
+        <label id="weight-unit-field" hidden>模型长度单位
+          <select id="weight-unit">
+            <option value="">请选择</option>
+            <option value="mm">毫米</option>
+            <option value="cm">厘米</option>
+            <option value="m">米</option>
+            <option value="in">英寸</option>
+            <option value="ft">英尺</option>
+            <option value="µm">微米</option>
+          </select>
+        </label>
+        <label id="weight-area-field" hidden>净面积 (mm²)
+          <input id="weight-area" type="number" min="0" step="any" inputmode="decimal">
+        </label>
+        <label id="weight-thickness-field" hidden>板厚 (mm)
+          <input id="weight-thickness" type="number" min="0" step="any" inputmode="decimal">
+        </label>
+      </div>
+      <div class="weight-readout">
+        <output id="weight-result" role="status"></output>
+        <small id="weight-note"></small>
+      </div>
+    </section>
+    <div id="projection-settings" class="projection-settings" aria-label="三视图排版" hidden>
+      <label>主视方向 <select id="projection-front" aria-label="三视图主视方向">
+        <option value="auto">自动推荐</option><option value="ny">−Y</option><option value="py">+Y</option>
+        <option value="nx">−X</option><option value="px">+X</option><option value="nz">−Z</option><option value="pz">+Z</option>
+      </select></label>
+      <label>视图转向 <select id="projection-turn" aria-label="三视图转向"><option value="auto">自动</option><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></label>
+      <label>最小间距 <input id="projection-gap" type="number" min="0" max="10000" step="any" placeholder="自动" aria-label="三视图最小间距" title="单位为毫米；源模型未声明单位时按原坐标单位。视图标签另留位置。"></label>
+      <label>PDF 纸张 <select id="projection-paper" aria-label="三视图纸张"><option value="auto">A4</option><option value="a3-auto">A3</option></select></label>
+      <label title="显示原模型面分区之间的边界。默认隐藏内部辅助线；实体棱边、孔槽和折弯外轮廓保留。"><input id="projection-seams" type="checkbox"> 模型分区线</label>
+      <details class="frame-fields"><summary>图框信息（已知信息自动带入，可补填）</summary><p>自动带入文件名、所选节点及模型外形尺寸。未提供的制造信息显示待核；圆孔及间距仅在可可靠识别时标注。</p><div><label>图号 <input data-frame-field="drawingNo" aria-label="图框图号" maxlength="240" placeholder="自动使用文件名"></label><label>零件名 <input data-frame-field="partName" aria-label="图框零件名" maxlength="240" placeholder="自动使用所选零件名"></label><label>材质 <input data-frame-field="material" aria-label="图框材质" maxlength="240" placeholder="待核"></label><label>厚度 <input data-frame-field="thickness" aria-label="图框厚度" maxlength="240" placeholder="待核"></label><label>数量 <input data-frame-field="quantity" aria-label="图框数量" maxlength="240" placeholder="待核"></label><label>表面处理 <input data-frame-field="surface" aria-label="图框表面处理" maxlength="240" placeholder="待核"></label><label>展开尺寸 <input data-frame-field="unfolded" aria-label="图框展开尺寸" maxlength="240" placeholder="待核"></label><label>技术要求 <input data-frame-field="requirements" aria-label="图框技术要求" maxlength="240" placeholder="待核"></label><label>工艺流程 <input data-frame-field="process" aria-label="图框工艺流程" maxlength="240" placeholder="待核"></label><label>折弯系数 <input data-frame-field="bendFactor" aria-label="图框折弯系数" maxlength="240" placeholder="待核"></label><label>质量 <input data-frame-field="mass" aria-label="图框质量" maxlength="240" placeholder="待核"></label></div></details>
+      <span id="projection-layout-info" role="status">第一角法；可在推荐方案上手动调整。</span>
     </div>
     <div class="file-bar"><strong id="file-name">尚未打开图纸</strong><span id="file-meta"></span></div>
     <section id="measure-panel" class="measure-panel" aria-label="测量结果" hidden>
@@ -76,6 +124,7 @@
     <div id="message" class="message" role="status" hidden></div>
     <div id="work-area" class="work-area">
       <section id="viewport" class="viewport" aria-label="图纸预览区">
+        <svg id="pdf-region-overlay" aria-hidden="true" hidden><rect id="pdf-region-box" hidden></rect></svg>
         <svg id="drawing" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CAD 图纸预览" viewBox="0 0 100 100">
           <g id="world" transform="scale(1 -1)"></g>
         </svg>

@@ -8,12 +8,10 @@ export function createDrawingBuffer(canvas, viewport, world) {
       2560 / Math.max(view.width, view.height));
     const width = Math.max(1, Math.round(view.width * scale));
     const height = Math.max(1, Math.round(view.height * scale));
-    const background = getComputedStyle(viewport).getPropertyValue('--drawing-background').trim();
     const url = URL.createObjectURL(new Blob([
       `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" preserveAspectRatio="none"
-        viewBox="${view.x} ${view.y} ${view.width} ${view.height}">
-        <style>text{font-family:"Microsoft YaHei UI","PingFang SC","Noto Sans CJK SC",Arial,sans-serif;white-space:pre}
-        .layer-off{display:none}.wipeout-fill{fill:${background}}</style>`, markup, '</svg>',
+        font-family="Microsoft YaHei UI, PingFang SC, Noto Sans CJK SC, Arial, sans-serif" xml:space="preserve"
+        viewBox="${view.x} ${view.y} ${view.width} ${view.height}">`, markup, '</svg>',
     ], { type: 'image/svg+xml' }));
     try {
       const image = new Image();
@@ -34,7 +32,13 @@ export function createDrawingBuffer(canvas, viewport, world) {
     source = overview = detail = undefined;
     if (!context || !view) return;
     overviewTimer = setTimeout(async () => {
-      source = new Blob([world.outerHTML]);
+      // SVG images inherit the host's CSP. Presentation attributes preserve
+      // the drawing under style-src 'self' without an inline stylesheet.
+      const snapshot = world.cloneNode(true);
+      const background = getComputedStyle(viewport).getPropertyValue('--drawing-background').trim();
+      for (const element of snapshot.querySelectorAll('.layer-off')) element.setAttribute('display', 'none');
+      for (const element of snapshot.querySelectorAll('.wipeout-fill')) element.setAttribute('fill', background);
+      source = new Blob([snapshot.outerHTML]);
       try {
         const image = await capture(view, source);
         if (version === revision) overview = image;

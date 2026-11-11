@@ -2,6 +2,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { meshLabel, hasArea } from './mesh-scene.mjs';
 import { projectionTriangleLimit } from '../public/cad-limits.mjs';
+import { collectPlanarFace, mapPlanarFaces } from './mesh-topology.mjs';
+import { meshVolume, totalMeshVolume, volumeTriangleBudget } from './mesh-volume.mjs';
 
 const axes = [0, 1, 2];
 const low = () => [Infinity, Infinity, Infinity];
@@ -16,9 +18,11 @@ function include(min, max, a, b = a) {
   }
 }
 
-function collect(geometry, available) {
+function collect(geometry, available, volumeBudget) {
   let vertices = new Float64Array(9 * 256), count = 0, visited = 0;
   const min = low(), max = high();
+  const planarFaces = [];
+  const curvedFaces = [];
   for (const triangle of geometry()) {
     if (++visited > maxPartFaces) throw new Error('单个零件超过网格容量。');
     if (!triangle.every(value => Math.abs(value) <= 1e100)) throw new Error('零件包含无效坐标。');
@@ -29,6 +33,10 @@ function collect(geometry, available) {
       next.set(vertices);
       vertices = next;
     }
+    if (count < projectionTriangleLimit) {
+      collectPlanarFace(planarFaces, triangle, count);
+      collectPlanarFace(curvedFaces, triangle, count, 'curvedFace');
+    } else { planarFaces.length = 0; curvedFaces.length = 0; }
     vertices.set(triangle, count++ * 9);
     for (const i of axes) {
       min[i] = Math.min(min[i], triangle[i], triangle[i + 3], triangle[i + 6]);
@@ -41,7 +49,10 @@ function collect(geometry, available) {
   const span = Math.max(...size);
   const positions = Buffer.allocUnsafe(count * 36);
   for (let i = 0; i < count * 9; i++) positions.writeFloatLE((vertices[i] - origin[i % 3]) / span, i * 4);
-  return { origin, span, size, count, positions };
+  const volume = count <= volumeBudget ? meshVolume(vertices, 0, count) : { reason: 'limit' };
+  return { origin, span, size, count, positions, volume,
+    planarFaces: count <= projectionTriangleLimit ? mapPlanarFaces(planarFaces, p=>p.map((v,i)=>(v-origin[i])/span)) : [],
+    curvedFaces: count <= projectionTriangleLimit ? mapPlanarFaces(curvedFaces, p=>p.map((v,i)=>(v-origin[i])/span)) : [] };
 }
 
 function overview(positions, count) {
@@ -78,8 +89,9 @@ export function assemblyMeshPath(directory, id, coarse = false) {
   return join(directory, id + (coarse ? '.coarse' : '.mesh'));
 }
 
-export function buildAssemblyScene(markers, directory, format, asset) {
+export function buildAssemblyScene(markers, directory, format, asset, calculateVolume = true) {
   const definitions = new Map(), meshes = [], tree = [], stack = [], issues = new Map();
+  const volumes = [];
   let uniqueCount = 0, unavailable = 0, instances = 0;
   const min = low(), max = high();
 
@@ -104,12 +116,15 @@ export function buildAssemblyScene(markers, directory, format, asset) {
     instances++;
     if (!definitions.has(marker.definition)) {
       let data;
-      try { data = collect(marker.geometry, maxUniqueFaces - uniqueCount); }
+      try { data = collect(marker.geometry, maxUniqueFaces - uniqueCount,
+        calculateVolume ? volumeTriangleBudget - uniqueCount : 0); }
       catch (error) { definitions.set(marker.definition, { error: error.message }); }
       if (data) {
-        const { positions, ...info } = data;
+        const { positions, planarFaces, curvedFaces, ...info } = data;
         const id = meshes.length;
         writeFileSync(assemblyMeshPath(directory, id), positions, { flag: 'wx' });
+        if (planarFaces.length) writeFileSync(join(directory,id+'.planes.json'),JSON.stringify(planarFaces),{flag:'wx'});
+        if (curvedFaces.length) writeFileSync(join(directory,id+'.curves.json'),JSON.stringify(curvedFaces),{flag:'wx'});
         const coarse = overview(positions, info.count);
         if (coarse) writeFileSync(assemblyMeshPath(directory, id, true), coarse, { flag: 'wx' });
         meshes.push({ count: info.count, coarseCount: coarse ? coarse.length / 36 : 0 });
@@ -132,6 +147,15 @@ export function buildAssemblyScene(markers, directory, format, asset) {
       .map((value, axis) => value - translate[axis]));
     const center = marker.placement(origin);
     if (![...basis, ...center].every(Number.isFinite)) throw new Error('装配包含无效的实例变换。');
+    if (calculateVolume) {
+      const volume = definition.volume;
+      if (!volume.value) volumes.push(volume);
+      else {
+        const [a,b,c,d,e,f,g,h,i] = basis.map(value => value / span);
+        const scale = Math.abs(a * (e*i - f*h) - b * (d*i - f*g) + c * (d*h - e*g));
+        volumes.push(scale > 0 ? { value: volume.value * scale } : { reason: 'open' });
+      }
+    }
     const orientation = basis.join(',');
     let bounds = oriented.get(orientation);
     if (!bounds) {
@@ -186,7 +210,8 @@ export function buildAssemblyScene(markers, directory, format, asset) {
   }
   normalize(tree);
   const scene = {
-    format, mesh: { asset, tree, meshes, unit: 'mm', count, uniqueCount, instances, unavailable, size, origin },
+    format, mesh: { asset, tree, meshes, unit: 'mm', count, uniqueCount, instances, unavailable, size, origin,
+      ...(calculateVolume && { volume: unavailable ? { reason: 'incomplete' } : totalMeshVolume(volumes) }) },
     issues: [['按需加载的预览使用离散网格，测量使用零件的完整预览网格。', 1],
       ...Array.from(issues, ([reason, total]) => ['零件几何未读取。' + reason, total])],
     ...(unavailable && { projectionAvailable: false }),
@@ -214,6 +239,7 @@ export function readAssemblyProjection(directory, partPath) {
   if (count > projectionTriangleLimit) throw new Error('三视图目前支持 20 万个三角面以内的模型，请选择较小的装配节点。');
   const positions = new Float64Array(count * 9);
   const meshes = new Map(), min = low(), max = high();
+  const planarFaces = [], curvedFaces = [], partRanges = [];
   let next = 0;
   function fill(nodes) {
     for (const node of nodes) {
@@ -222,6 +248,16 @@ export function readAssemblyProjection(directory, partPath) {
       const { meshId, basis, translation } = node;
       if (!meshes.has(meshId)) meshes.set(meshId, readFileSync(assemblyMeshPath(directory, meshId)));
       const data = meshes.get(meshId);
+      const partStart = next / 9;
+      partRanges.push({start:partStart,count:node.count});
+      let sourcePlanes;
+      try {sourcePlanes=JSON.parse(readFileSync(join(directory,meshId+'.planes.json'),'utf8'));}
+      catch(error){if(error.code!=='ENOENT')throw error;}
+      if(sourcePlanes)for(const face of mapPlanarFaces(sourcePlanes,p=>axes.map(axis=>p[0]*basis[axis]+p[1]*basis[axis+3]+p[2]*basis[axis+6]+translation[axis])))planarFaces.push({...face,start:face.start+partStart});
+      let sourceCurves;
+      try {sourceCurves=JSON.parse(readFileSync(join(directory,meshId+'.curves.json'),'utf8'));}
+      catch(error){if(error.code!=='ENOENT')throw error;}
+      if(sourceCurves)for(const face of mapPlanarFaces(sourceCurves,p=>axes.map(axis=>p[0]*basis[axis]+p[1]*basis[axis+3]+p[2]*basis[axis+6]+translation[axis])))curvedFaces.push({...face,start:face.start+partStart});
       for (let i = 0; i < data.length; i += 12) {
         const x = data.readFloatLE(i), y = data.readFloatLE(i + 4), z = data.readFloatLE(i + 8);
         for (const axis of axes) {
@@ -240,5 +276,7 @@ export function readAssemblyProjection(directory, partPath) {
   const bytes = Buffer.allocUnsafe(count * 36);
   for (let i = 0; i < positions.length; i++) bytes.writeFloatLE((positions[i] - center[i % 3]) / span, i * 4);
   return { mesh: { count, unit: scene.mesh.unit, size: size.map(value => value * Math.max(...scene.mesh.size)),
-    positions: bytes.toString('base64') }, issues: [], partLabel: label };
+    positions: bytes.toString('base64'),partRanges,
+    ...(planarFaces.length&&{planarFaces:mapPlanarFaces(planarFaces,p=>p.map((v,i)=>(v-center[i])/span))}),
+    ...(curvedFaces.length&&{curvedFaces:mapPlanarFaces(curvedFaces,p=>p.map((v,i)=>(v-center[i])/span))}) }, issues: [], partLabel: label };
 }

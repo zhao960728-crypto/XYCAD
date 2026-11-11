@@ -510,3 +510,22 @@ test('crossing trim edges split at the intersection before even-odd filling', ()
   assert.equal(area, 2);
   assert.ok(faces.every(face => face.some(([x, y]) => x === 1 && y === 1)));
 });
+
+test('a densely perforated face keeps every hole without a levels-times-edges rejection', () => {
+  const holes=1800,height=holes*3+2;
+  const loops=[[[0,0],[5,0],[5,height],[0,height]]];
+  for(let i=0;i<holes;i++){const y=i*3+1;loops.push([[1,y],[2,y],[2,y+.25],[1,y+.25]]);}
+  let area=0;
+  for(const [[ax,ay],[bx,by],[cx,cy]] of uvTriangles(loops,1e-8))
+    area+=Math.abs((bx-ax)*(cy-ay)-(by-ay)*(cx-ax))/2;
+  assert.equal(area,5*height-holes*.25);
+});
+
+test('a periodic cylinder wire with equally directed full rims keeps its finite band',()=>{
+  const frame=axes([0,0,0],[0,0,1]);
+  const circle=z=>Array.from({length:97},(_,i)=>[2*Math.cos(i*Math.PI/48),2*Math.sin(i*Math.PI/48),z]);
+  const ring=[...circle(0),...circle(5)];
+  const triangles=[...faceTriangles({frame,radius:2,slope:0},[ring],1e-8)];
+  const area=triangles.reduce((s,t)=>s+Math.hypot(...cross(sub(t.slice(3,6),t.slice(0,3)),sub(t.slice(6,9),t.slice(0,3))))/2,0);
+  assert(Math.abs(area-20*Math.PI)<.02);assert(triangles.every(t=>[0,3,6].every(i=>Math.abs(Math.hypot(t[i],t[i+1])-2)<1e-10)));
+});

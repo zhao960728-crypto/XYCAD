@@ -1,5 +1,7 @@
-import { formatHints, uploadExtensions, uploadHint, projectionHiddenLayers, projectionTriangleLimit } from './cad-limits.mjs';
+import {drawingPdf} from './drawing-pdf.mjs';
+import { formatHints, uploadExtensions, uploadHint, projectionHiddenLayers, projectionTriangleLimit, projectionHiddenMask } from './cad-limits.mjs';
 import { MeshViewer, partColor } from './mesh-viewer.mjs';
+import { createWeightTools } from './weight-tools.mjs';
 import { drawingUnits } from './cad-measure.mjs';
 import { createMeasureTools } from './measure-tools.mjs';
 import { createDrawingBuffer } from './drawing-buffer.mjs';
@@ -17,6 +19,104 @@ const empty = byId('empty');
 const layerList = byId('layers');
 const controls = ['fit', 'in', 'out'].map(byId);
 const download = byId('download');
+const downloadPdf=byId('download-pdf'),drawingPdfPaper=byId('drawing-pdf-paper');
+
+const pickPdfRegion = byId('pick-pdf-region');
+const clearPdfRegion = byId('clear-pdf-region');
+const pdfRegionOverlay = byId('pdf-region-overlay');
+const pdfRegionBox = byId('pdf-region-box');
+let pdfRegion = null, pdfDrag = null, pdfPicking = false;
+
+function renderPdfRegion() {
+  pickPdfRegion.setAttribute('aria-pressed', String(pdfPicking));
+  pdfRegionOverlay.classList.toggle('picking', pdfPicking);
+  pdfRegionOverlay.toggleAttribute('hidden', !pdfPicking && !pdfRegion);
+  clearPdfRegion.hidden = !pdfRegion;
+  pdfRegionBox.toggleAttribute('hidden', true);
+  const bounds = viewport.getBoundingClientRect();
+  let a, b;
+  if (pdfDrag) {
+    ({ a, b } = pdfDrag);
+  } else if (pdfRegion) {
+    const matrix = drawingMatrix();
+    if (!matrix) return;
+    a = new DOMPoint(pdfRegion.x, pdfRegion.y).matrixTransform(matrix);
+    b = new DOMPoint(pdfRegion.x + pdfRegion.width, pdfRegion.y + pdfRegion.height).matrixTransform(matrix);
+  } else return;
+  pdfRegionBox.setAttribute('x', Math.min(a.x,b.x) - bounds.left);
+  pdfRegionBox.setAttribute('y', Math.min(a.y,b.y) - bounds.top);
+  pdfRegionBox.setAttribute('width', Math.abs(a.x-b.x));
+  pdfRegionBox.setAttribute('height', Math.abs(a.y-b.y));
+  pdfRegionBox.toggleAttribute('hidden', false);
+}
+
+function endPdfPicking() {
+  if (pdfDrag && pdfRegionOverlay.hasPointerCapture(pdfDrag.id)) pdfRegionOverlay.releasePointerCapture(pdfDrag.id);
+  pdfDrag = null;
+  pdfPicking = false;
+  renderPdfRegion();
+}
+
+function pdfPointer(event) {
+  const bounds = viewport.getBoundingClientRect();
+  return new DOMPoint(Math.max(bounds.left,Math.min(bounds.right,event.clientX)),
+    Math.max(bounds.top,Math.min(bounds.bottom,event.clientY)));
+}
+
+pickPdfRegion.addEventListener('click', () => {
+  if (!state.visibleCount || state.mesh || state.request) return;
+  if (pdfPicking) {
+    endPdfPicking();
+    setMessage('');
+    return;
+  }
+  finishMotion();
+  pdfPicking = true;
+  renderPdfRegion();
+  setMessage('在图纸上拖出矩形范围，再点击「转 PDF」。');
+});
+clearPdfRegion.addEventListener('click', () => {
+  pdfRegion = null;
+  endPdfPicking();
+  setMessage('');
+});
+pdfRegionOverlay.addEventListener('pointerdown', event => {
+  if (!pdfPicking || event.button !== 0 || pdfDrag) return;
+  event.stopPropagation();
+  const point = pdfPointer(event);
+  pdfDrag = {id:event.pointerId,a:point,b:point};
+  pdfRegionOverlay.setPointerCapture(event.pointerId);
+  renderPdfRegion();
+});
+pdfRegionOverlay.addEventListener('pointermove', event => {
+  if (pdfDrag?.id !== event.pointerId) return;
+  pdfDrag.b = pdfPointer(event);
+  renderPdfRegion();
+});
+pdfRegionOverlay.addEventListener('pointerup', event => {
+  if (pdfDrag?.id !== event.pointerId) return;
+  const a=pdfDrag.a, b=pdfPointer(event);
+  if (Math.abs(a.x-b.x)<8 || Math.abs(a.y-b.y)<8) {
+    endPdfPicking();
+    setMessage('框选范围太小，请重新框选。', true);
+    return;
+  }
+  const inverse = drawingMatrix()?.inverse();
+  if (!inverse) { endPdfPicking(); return; }
+  const start=a.matrixTransform(inverse), end=b.matrixTransform(inverse);
+  pdfRegion={x:Math.min(start.x,end.x),y:Math.min(start.y,end.y),
+    width:Math.abs(start.x-end.x),height:Math.abs(start.y-end.y)};
+  endPdfPicking();
+  setMessage('已选定 PDF 范围。点击「转 PDF」导出。');
+});
+pdfRegionOverlay.addEventListener('pointercancel', endPdfPicking);
+window.addEventListener('keydown', event => {
+  if (event.key==='Escape' && pdfPicking) {
+    endPdfPicking();
+    setMessage('');
+  }
+});
+
 const downloadSheet = byId('download-sheet');
 const sheetFormat = byId('sheet-format');
 const sheetView = byId('sheet-view');
@@ -33,10 +133,20 @@ const projectionFormat = byId('projection-format');
 const projectionExport = byId('projection-export');
 const projectionHidden = byId('projection-hidden');
 const projectionFront = byId('projection-front');
+const projectionTurn=byId('projection-turn'),projectionGap=byId('projection-gap'),projectionPaper=byId('projection-paper');
+const projectionSeams=byId('projection-seams');
+const frameInputs=[...document.querySelectorAll('[data-frame-field]')];
+const projectionControls=[projectionFront,projectionTurn,projectionGap,projectionPaper,projectionSeams,...frameInputs];
+function projectionValues(){
+  if(!projectionGap.checkValidity())throw Error('最小间距须在 0 至 10000 之间。');
+  return {front:projectionFront.value,turn:projectionTurn.value,paper:projectionPaper.value,gap:projectionGap.value===''?null:Number(projectionGap.value),seams:projectionSeams.checked?'1':'0',metadata:Object.fromEntries(frameInputs.map(input=>[input.dataset.frameField,input.value]).filter(([,v])=>v.trim()))};
+}
+function setProjectionValues(v){projectionFront.value=v.front;projectionTurn.value=v.turn;projectionPaper.value=v.paper?.startsWith('a3')?'a3-auto':'auto';projectionGap.value=v.gap??'';projectionSeams.checked=v.seams==='1';frameInputs.forEach(input=>input.value=v.metadata?.[input.dataset.frameField]??'');}
 const state = { items: [], layers: [], view: null, request: null };
 const bufferedPanThreshold = 10_000;
 let meshViewer;
 const measurement = createMeasureTools(viewport, drawingMatrix, () => state.items, () => meshViewer);
+const weightTools = createWeightTools();
 const measure = document.createElement('canvas').getContext('2d');
 measure.font = '100px "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif';
 const segmenter = new Intl.Segmenter('zh', { granularity: 'word' });
@@ -216,6 +326,7 @@ function paintMotion(panRect) {
   drawingBuffer.cancelDetail();
   if (!state.bufferedPan || !drawingBuffer.draw(state.view)) paintVector(panRect);
   measurement.redraw();
+  if (pdfRegion || pdfPicking) renderPdfRegion();
 }
 
 function clearMotion() {
@@ -230,6 +341,7 @@ function finishMotion() {
   if (!state.view || state.mesh) return;
   paintVector();
   measurement.redraw();
+  if (pdfRegion || pdfPicking) renderPdfRegion();
   if (state.bufferedPan) drawingBuffer.prepareDetail(state.view);
 }
 
@@ -356,15 +468,26 @@ function updateSheetControls(scene, index = 0) {
 
 function loadScene(scene, filename, page = 0, resumeMesh = false) {
   clearMotion();
+  downloadPdf.hidden=Boolean(scene.mesh)||(!scene.items?.length&&!scene.sheets?.length&&!scene.image);
+  drawingPdfPaper.hidden=downloadPdf.hidden||Boolean(scene.projection);
+  pickPdfRegion.hidden=downloadPdf.hidden;
+  pdfRegion=null;
+  endPdfPicking();
   drawingBuffer.reset(null);
   makeProjection.hidden = !scene.mesh || scene.projectionAvailable === false ||
-    (scene.mesh.asset && scene.mesh.count > projectionTriangleLimit);
+    (scene.mesh.asset && !scene.mesh.kernelProjection && scene.mesh.count > projectionTriangleLimit);
   backToMesh.hidden = projectionExport.hidden = !scene.projection;
   projectionFront.hidden = !scene.mesh && !scene.projection;
-  if (!resumeMesh) projectionFront.value = scene.projectionFront ?? 'ny';
+  byId('projection-settings').hidden=projectionFront.hidden;
+  if (!resumeMesh) setProjectionValues(scene.projectionOptions??{front:scene.projectionFront??'auto',turn:'auto',paper:'auto',gap:null});
+  const layout=scene.projectionLayout;
+  byId('projection-layout-info').textContent=layout
+    ? `第一角法 · 主视 ${layout.front[0]==='n'?'−':'+'}${layout.front[1].toUpperCase()} · 转向 ${layout.turn}° · ${layout.paper.name.replace('landscape','横向').replace('portrait','竖向')} · 含轴测图、自动尺寸及自适应图框 · DXF 1:1`
+    : '第一角法；在模型轴向中推荐方向和排版，可手动调整。';
   if (scene.mesh) {
     loadMesh(scene, filename, resumeMesh);
-    measurement.configure({ dimension: 3, unit: scene.mesh.unit, scale: Math.max(...scene.mesh.size), origin: scene.mesh.origin });
+    weightTools.configure(scene, true);
+    measurement.configure(scene.measurementAvailable===false?null:{ dimension: 3, unit: scene.mesh.unit, scale: Math.max(...scene.mesh.size), origin: scene.mesh.origin });
     updateSheetControls(null);
     return;
   }
@@ -372,6 +495,7 @@ function loadScene(scene, filename, page = 0, resumeMesh = false) {
   const image = scene.image;
   const fragment = document.createDocumentFragment();
   const previewItems = image ? [{ ...image, kind: 'image', layerIds: [] }] : (sheet?.items ?? scene.items);
+  weightTools.configure(scene, !image && previewItems.length > 0, page);
   const items = previewItems.map(item => {
     const element = drawItem(item);
     if (item.kind === 'image') element.addEventListener('error', () => {
@@ -461,7 +585,7 @@ function updateMeshSpread() {
   meshViewer.setExplosion(meshSpread.valueAsNumber / 100);
 }
 
-function mountMeshTree(tree, canProjectParts) {
+function mountMeshTree(tree, canProjectParts, kernelProjection = false) {
   const leaves = [];
   const spans = new Map();
   const checkboxes = new Map();
@@ -580,7 +704,7 @@ function mountMeshTree(tree, canProjectParts) {
       label.append(total);
     }
     row.append(label);
-    if (canProjectParts && node.count && node.count <= projectionTriangleLimit && node.projectionAvailable !== false) {
+    if (canProjectParts && node.count && (kernelProjection || node.count <= projectionTriangleLimit) && node.projectionAvailable !== false) {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'mesh-project';
@@ -648,7 +772,7 @@ function loadMesh({ format, mesh, issues, configurations, selectedConfiguration 
   const selected = configurations?.find(row => row.id === selectedConfiguration);
   if (selected) byId('file-meta').textContent += ' · 配置 ' + selected.name;
   if (resume) state.refreshParts();
-  else mountMeshTree(tree, Boolean(mesh.tree));
+  else mountMeshTree(tree, Boolean(mesh.tree), Boolean(mesh.kernelProjection));
   byId('view-hints').textContent = '拖动旋转 · Shift + 拖动平移 · 滚轮缩放 · 双击适配';
   updateWarnings(issues);
 }
@@ -698,6 +822,7 @@ async function openDrawing(filename, readFile, block = '', formatHint, configura
   state.request?.abort();
   const request = new AbortController();
   state.request = request;
+  byId('cancel-load').hidden=false;
   const signal = request.signal;
   setMessage(block ? '正在读取图块…' : `正在读取 ${filename}…`);
   blockView.disabled = true;
@@ -706,22 +831,48 @@ async function openDrawing(filename, readFile, block = '', formatHint, configura
     const file = await readFile(signal);
     const route = block ? `./api/preview?block=${encodeURIComponent(block)}` : './api/preview';
     const shared = !block && ['x_t', 'step', 'stp'].includes(formatHint);
+    const asynchronous = shared || formatHint === 'sldprt';
     const response = await fetch(route, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream', ...(formatHint && { 'X-XYCAD-Format': formatHint }),
         ...(configuration !== undefined && { 'X-XYCAD-Configuration': configuration }),
-        ...(shared && { 'X-XYCAD-Assembly': '1' }) },
+        ...(shared && { 'X-XYCAD-Assembly': '1' }),...(asynchronous&&{Prefer:'respond-async'}) },
       body: file,
       signal,
     });
     if (!response.headers.get('content-type')?.startsWith('application/json')) throw new Error('预览服务不可用。');
-    const result = await response.json();
+    let result = await response.json();
+    if(response.status===202&&result.job?.id){
+      if(!/^[0-9a-f-]{36}$/.test(result.job.id))throw Error('后台载入返回无效编号。');
+      const jobUrl='./api/preview-jobs/'+result.job.id;
+      const cancel=()=>{void fetch(jobUrl,{method:'DELETE',keepalive:true}).catch(()=>{});};
+      signal.addEventListener('abort',cancel,{once:true});
+      let showedPreview=false;
+      try{
+        for(;;){
+          await new Promise((resolve,reject)=>{const timer=setTimeout(done,600);function done(){signal.removeEventListener('abort',abort);resolve();}function abort(){clearTimeout(timer);reject(signal.reason);}signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();});
+          const poll=await fetch(jobUrl+(showedPreview?'':'?preview=1'),{signal});result=await poll.json();
+          if(!poll.ok)throw Error(result.error||'读取载入状态失败。');
+          if(result.status==='ready')break;
+          if(result.status!=='loading')throw Error(result.error||'后台载入未完成。');
+          if(result.previewScene&&!showedPreview&&state.request===request){
+            loadScene(result.previewScene,filename);state.meshSource=null;
+            state.previewFile=state.downloadFile=state.sheetFile=null;
+            download.hidden=true;byId('sheet-export').hidden=true;updatePartConfigurations(null);showedPreview=true;
+          }
+          const stage={'read-configuration':'正在读取保存配置','read-geometry':'正在解析装配与曲面','kernel-read':'正在使用本机内核辅助读取','kernel-mesh':'正在准备显示网格'}[result.stage]||'正在准备模型';
+          const progress=result.total?`（${result.completed??0}/${result.total}）`:'';
+          setMessage(`${stage}${progress} · ${Math.floor((result.elapsedMs??0)/1000)} 秒；可打开其他文件取消本次载入。`);
+        }
+      }finally{signal.removeEventListener('abort',cancel);}
+    }
     if (state.request !== request) return;
     const details = result.scene ?? result;
     if (formatHint === 'sldprt' && details.configurations) updatePartConfigurations(details, file, filename);
     if (!response.ok) throw new Error(result.error || '图纸读取失败。');
     if (formatHint !== 'sldprt') updatePartConfigurations(null);
     loadScene(result.scene, filename);
+    state.pdfOriginal=file;
     state.meshSource = result.scene.mesh ? { scene: result.scene, file, filename, formatHint } : null;
     state.previewFile = result.scene.blockViews?.length ? file : null;
     state.downloadFile = result.scene.dwgVersion && !result.scene.image ? file : null;
@@ -738,17 +889,19 @@ async function openDrawing(filename, readFile, block = '', formatHint, configura
   } catch (error) {
     if (state.request === request) {
       blockView.value = state.block ?? '';
-      showOpenFailure(filename, signal.aborted ? '预览请求超时，请重试。' : error.message);
+      showOpenFailure(filename, signal.aborted ? '载入已取消。' : error.message);
     }
   } finally {
     if (state.request === request) {
       state.request = null;
+      byId('cancel-load').hidden=true;
       blockView.disabled = false;
       partConfiguration.disabled = false;
     }
   }
 }
 
+byId('cancel-load').addEventListener('click',()=>state.request?.abort());
 blockView.addEventListener('change', () => {
   const file = state.previewFile;
   if (file) openDrawing(byId('file-name').textContent, () => file, blockView.value);
@@ -791,15 +944,11 @@ async function saveDrawing(key, route, suffix, formatHint) {
 }
 
 function visibleHiddenMask() {
-  let mask = 7;
-  for (const { name, checkbox } of state.layers) {
-    const index = projectionHiddenLayers.indexOf(name);
-    if (index !== -1 && !checkbox.checked) mask &= ~(1 << index);
-  }
-  return mask;
+  return projectionHiddenMask(state.layers,state.projectionHiddenMask??7);
 }
 
 function applyHiddenMask(mask) {
+  state.projectionHiddenMask=mask;
   for (const { name, checkbox } of state.layers) {
     const index = projectionHiddenLayers.indexOf(name);
     if (index !== -1) checkbox.checked = Boolean(mask & (1 << index));
@@ -807,10 +956,11 @@ function applyHiddenMask(mask) {
   updateLayers();
 }
 
-function projectionRoute(part, front, format) {
+function projectionRoute(part, settings, format) {
   const params = new URLSearchParams();
   if (part) params.set('part', part);
-  if (front !== 'ny') params.set('front', front);
+  for(const [key,value] of Object.entries(settings)){if(key==='metadata'){for(const [field,text] of Object.entries(value))params.set(field,text);}else if(value!==null)params.set(key,String(value));}
+  params.set('sourceName',state.meshSource?.filename?.slice(0,240)??'');
   if (format) {
     params.set('format', format);
     const mask = visibleHiddenMask();
@@ -824,19 +974,24 @@ function projectionRoute(part, front, format) {
 async function openProjection(part, button) {
   const source = state.meshSource;
   if (!source || state.request) return;
-  const front = projectionFront.value;
-  if (source.projection?.part === part && source.projection.front === front) {
+  let settings;
+  try {settings=projectionValues();}catch(error){setMessage(error.message,true);return;}
+  const front=settings.front,key=JSON.stringify(settings);
+  if (source.projection?.part === part && source.projection.key === key) {
+    const hidden=visibleHiddenMask();
     loadScene(source.projection.scene, source.filename);
+    applyHiddenMask(hidden);
     setMessage('');
     return;
   }
   const request = new AbortController();
   state.request = request;
   makeProjection.disabled = projectionFront.disabled = button.disabled = true;
-  const hidden = state.mesh ? 7 : visibleHiddenMask();
+  projectionControls.forEach(c=>c.disabled=true);downloadProjection.disabled=true;
+  const hidden = state.mesh ? state.projectionHiddenMask??7 : visibleHiddenMask();
   setMessage(part ? '正在计算所选节点的三视图…' : '正在计算三视图和遮挡线…');
   try {
-    const response = await fetch(projectionRoute(part, front), source.scene.mesh.asset ? { signal: request.signal } : {
+    const response = await fetch(projectionRoute(part, settings), source.scene.mesh.asset ? { signal: request.signal } : {
       method: 'POST', body: source.file,
       headers: { 'Content-Type': 'application/octet-stream', ...(source.formatHint && { 'X-XYCAD-Format': source.formatHint }) },
       signal: request.signal,
@@ -851,23 +1006,24 @@ async function openProjection(part, button) {
     if (!response.ok) throw new Error(result.error || '三视图生成失败。');
     if (part && result.scene.projectionPart?.path !== part) throw new Error('三视图结果与所选节点不一致，请重试。');
     if (result.scene.projectionFront !== front) throw new Error('服务返回的主视方向不一致，请更新本地服务。');
-    source.projection = { part, front, scene: result.scene };
+    source.projection = { part, front, settings,key, scene: result.scene };
     loadScene(result.scene, source.filename);
-    if (hidden !== 7) applyHiddenMask(hidden);
+    applyHiddenMask(hidden);
     setMessage('');
   } catch (error) {
     if (state.request === request) {
-      if (!state.mesh) projectionFront.value = source.projection.front;
+      if (!state.mesh&&source.projection) setProjectionValues(source.projection.settings);
       setMessage(error.message, true);
     }
   } finally {
     if (state.request === request) state.request = null;
     makeProjection.disabled = projectionFront.disabled = button.disabled = false;
+    projectionControls.forEach(c=>c.disabled=false);downloadProjection.disabled=false;
   }
 }
 
 makeProjection.addEventListener('click', () => openProjection('', makeProjection));
-projectionFront.addEventListener('change', () => {
+for(const control of projectionControls)control.addEventListener('change', () => {
   if (!projectionExport.hidden && state.meshSource?.projection) {
     openProjection(state.meshSource.projection.part, downloadProjection);
   }
@@ -892,8 +1048,10 @@ downloadProjection.addEventListener('click', async () => {
   const format = projectionFormat.value;
   const suffix = (label ? '.' + label : '') + '.三视图.' + format;
   downloadProjection.disabled = projectionFormat.disabled = projectionFront.disabled = true;
-  try { await saveDrawing('meshSource', projectionRoute(projection.part, projection.front, format), suffix, source.formatHint); }
-  finally { downloadProjection.disabled = projectionFormat.disabled = projectionFront.disabled = false; }
+  projectionControls.forEach(c=>c.disabled=true);
+  try { await saveDrawing('meshSource', projectionRoute(projection.part, projection.settings, format), suffix, source.formatHint,
+    {kind:'orthographic',convention:'first-angle',settings:projection.settings,hiddenMask:visibleHiddenMask(),resolvedLayout:projection.scene.projectionLayout,geometry:projection.scene.projectionGeometry,part:projection.scene.projectionPart??null}); }
+  finally { downloadProjection.disabled = projectionFormat.disabled = projectionFront.disabled = false;projectionControls.forEach(c=>c.disabled=false); }
 });
 
 download.addEventListener('click', async () => {
@@ -1066,3 +1224,29 @@ new ResizeObserver(() => {
   const nextHeight = view.width * height / width;
   setView(view.x, view.y + (view.height - nextHeight) / 2, view.width, nextHeight);
 }).observe(viewport);
+
+// A direct PDF action is available for ordinary CAD and generated views.
+downloadPdf.addEventListener('click',async()=>{
+  if(state.request||downloadPdf.disabled)return;
+  downloadPdf.disabled=true;drawingPdfPaper.disabled=true;
+  try{
+    const projection=state.meshSource?.projection;
+    if(!projectionExport.hidden&&projection&&!pdfRegion){
+      await saveDrawing('meshSource',projectionRoute(projection.part,projection.settings,'pdf'),'_三视图.pdf',state.meshSource.formatHint);
+    }else{
+      setMessage('正在转换 PDF…');
+      const original=state.pdfOriginal;
+      endPdfPicking();
+      finishMotion();
+      const region=pdfRegion;
+      const paper=!projectionExport.hidden ? (projectionPaper.value.startsWith('a3')?'a3':'a4') : drawingPdfPaper.value;
+      const sourceItems=state.items;
+      const blob=await drawingPdf(world,paper,region);
+      if (state.items!==sourceItems) return;
+      const name=(original?.name||byId('file-name').textContent||'图纸').replace(/\.[^.]+$/,'')+(region?'_框选':'')+'.pdf';
+      const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=name;
+      link.click();setTimeout(()=>URL.revokeObjectURL(url),5000);setMessage('PDF 已导出。');
+    }
+  }catch(error){setMessage(error.message,true);}
+  finally{downloadPdf.disabled=false;drawingPdfPaper.disabled=false;}
+});

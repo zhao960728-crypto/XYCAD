@@ -12,6 +12,10 @@ import test from 'node:test';
 import { MiB } from '../public/cad-limits.mjs';
 import { parseDxf, name, number } from '../src/dxf-parser.mjs';
 
+const entityXs = entity => entity.type === 'LWPOLYLINE'
+  ? entity.groups.filter(([code]) => code === 10).map(([, value]) => Number(value))
+  : [number(entity, 10), number(entity, 11)];
+
 async function startServer(t, environment = {}) {
   const child = spawn(process.execPath, [fileURLToPath(new URL('../server.mjs', import.meta.url))], {
     env: { ...process.env, ...environment, XYCAD_HOST: '127.0.0.1', XYCAD_PORT: '0' },
@@ -391,7 +395,7 @@ test('a model projects into editable three-view DXF and splits a partially occlu
   assert.ok(Math.abs(Math.abs(number(hidden[0], 11) - number(hidden[0], 10)) - 2) < 1e-5);
   assert.ok(layer('TOP-VISIBLE').every(entity => number(entity, 20) < number(hidden[0], 20)));
   assert.ok(layer('RIGHT-VISIBLE').every(entity => number(entity, 10) < -4));
-  assert.deepEqual(layer('VIEW-LABELS').map(entity => name(entity, 1)), ['正视图', '俯视图', '右视图']);
+  assert.deepEqual(layer('VIEW-LABELS').map(entity => name(entity, 1)), ['正视图', '俯视图', '右视图', '轴测图']);
 
   const clean = await project('?format=dxf&hidden=0');
   const cleanDxf = parseDxf(new Uint8Array(await clean.arrayBuffer()));
@@ -410,16 +414,23 @@ test('a model projects into editable three-view DXF and splits a partially occlu
   }
   const pdf = await pdfVectors('?format=pdf');
   const cleanPdf = await pdfVectors('?format=pdf&hidden=0');
-  assert.match(pdf, /\[3 2\] 0 d\n[^\n]+ m [^\n]+ l S\n/);
-  assert.doesNotMatch(cleanPdf, /\[3 2\] 0 d\n[^\n]+ m [^\n]+ l S\n/);
-  assert.match(cleanPdf, /\(Front\) Tj[\s\S]+\(Top\) Tj[\s\S]+\(Right\) Tj/);
+  assert.match(pdf, /\[[\d.]+ [\d.]+\] 0 d\n[^\n]+ m [^\n]+ l S\n/);
+  assert.doesNotMatch(cleanPdf, /\[[\d.]+ [\d.]+\] 0 d\n[^\n]+ m [^\n]+ l S\n/);
+  assert.match(cleanPdf, /<6b6389c656fe> Tj[\s\S]+<4fef89c656fe> Tj[\s\S]+<53f389c656fe> Tj/);
   const side = await project('?front=px');
   assert.equal((await side.json()).scene.projectionFront, 'px');
   const sideDxf = parseDxf(new Uint8Array(await (await project('?front=px&format=dxf')).arrayBuffer()));
   const sideX = sideDxf.entities.filter(entity => name(entity, 8) === 'FRONT-VISIBLE')
-    .flatMap(entity => [number(entity, 10), number(entity, 11)]);
+    .flatMap(entityXs);
   assert.ok(Math.abs(Math.max(...sideX) - Math.min(...sideX) - 2) < 1e-5);
   assert.equal((await project('?front=iso')).status, 400);
+  for(const invalid of ['front=constructor','front=__proto__','paper=constructor','turn=45','gap=NaN','front=ny&front=py'])assert.equal((await project('?'+invalid)).status,400);
+  const settings='front=auto&turn=90&gap=2&paper=a3-portrait';
+  const adjusted=await project('?'+settings),adjustedScene=(await adjusted.json()).scene;
+  assert.equal(adjusted.status,200);assert.deepEqual(adjustedScene.projectionOptions,{front:'auto',turn:'90',paper:'a3-portrait',gap:2,seams:'0'});
+  assert.equal(adjustedScene.projectionLayout.turn,90);assert.equal(adjustedScene.projectionLayout.paper.width,297);
+  const adjustedPdf=Buffer.from(await(await project('?'+settings+'&format=pdf')).arrayBuffer());
+  assert.match(adjustedPdf.toString('latin1'),/\/MediaBox \[0 0 841\.8898 1190\.5512\]/);
 });
 
 test('the selected assembly occurrence projects before whole-model normalization', { timeout: 10000 }, async t => {
@@ -440,7 +451,7 @@ test('the selected assembly occurrence projects before whole-model normalization
     assert.equal(response.headers.get('content-type'), 'application/dxf');
     const { entities } = parseDxf(new Uint8Array(await response.arrayBuffer()));
     const front = entities.filter(entity => name(entity, 8) === 'FRONT-VISIBLE');
-    const positions = front.flatMap(entity => [number(entity, 10), number(entity, 11)]);
+    const positions = front.flatMap(entityXs);
     return Math.max(...positions) - Math.min(...positions);
   }
   assert.equal(await frontWidth('0'), 3);

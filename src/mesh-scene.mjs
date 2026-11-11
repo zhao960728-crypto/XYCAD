@@ -1,4 +1,6 @@
 import { meshLimits } from './cad-budget.mjs';
+import { collectPlanarFace, mapPlanarFaces } from './mesh-topology.mjs';
+import { meshVolume, totalMeshVolume, volumeTriangleBudget } from './mesh-volume.mjs';
 
 export const decimalPattern = '[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[Ee][+-]?[0-9]+)?';
 
@@ -18,6 +20,8 @@ export function buildMeshScene(format, unit, triangles, issues = [], partPath) {
   let vertices = new Float64Array(9 * 1024);
   let total = 0, count = 0;
   const tree = [], stack = [], colors = new Map();
+  const planarFaces = [];
+  const curvedFaces = [];
   const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
   for (const triangle of triangles) {
     // Section markers bracket contiguous triangle ranges without repeating an ID for every face.
@@ -57,6 +61,8 @@ export function buildMeshScene(format, unit, triangles, issues = [], partPath) {
       next.set(vertices);
       vertices = next;
     }
+    collectPlanarFace(planarFaces, triangle, count);
+    collectPlanarFace(curvedFaces, triangle, count, 'curvedFace');
     vertices.set(triangle, count++ * 9);
     const part = stack.at(-1)?.node;
     for (let i = 0; i < 9; i++) {
@@ -100,8 +106,24 @@ export function buildMeshScene(format, unit, triangles, issues = [], partPath) {
   count = part?.count ?? count;
   const packed = Buffer.allocUnsafe(count * 36);
   for (let i = 0; i < count * 9; i++) packed.writeFloatLE((vertices[start + i] - center[i % 3]) / span, i * 4);
-  return { format, mesh: { count, size, unit, origin: center, positions: packed.toString('base64'), ...(!part && tree.length && { tree }) },
+  const topology = mapPlanarFaces(planarFaces, p => p.map((v,i)=>(v-center[i])/span), start / 9, count);
+  const curves = mapPlanarFaces(curvedFaces, p => p.map((v,i)=>(v-center[i])/span), start / 9, count);
+  const partRanges = [];
+  function ranges(nodes) {
+    for (const node of nodes) {
+      if (node.children) ranges(node.children);
+      else if (node.count && node.start >= start / 9 && node.start + node.count <= start / 9 + count) partRanges.push({start:node.start-start/9,count:node.count});
+    }
+  }
+  ranges(part ? [part] : tree);
+  const incomplete = part ? part.projectionAvailable === false : tree.some(node => node.projectionAvailable === false);
+  // Treat model instances separately even when they share coincident surfaces.
+  const volume = incomplete ? { reason: 'incomplete' } : count > volumeTriangleBudget ? { reason: 'limit' }
+    : format !== 'OBJ' && partRanges.reduce((sum, range) => sum + range.count, 0) === count
+      ? totalMeshVolume(partRanges.map(range => meshVolume(vertices, start + range.start * 9, range.count)))
+      : meshVolume(vertices, start, count);
+  return { format, mesh: { count, size, unit, origin: center, volume, positions: packed.toString('base64'),
+    ...(topology.length && { planarFaces: topology }), ...(curves.length && {curvedFaces:curves}), ...(partRanges.length && {partRanges}), ...(!part && tree.length && { tree }) },
     issues, ...(part && { partLabel: part.label }),
-    ...((part ? part.projectionAvailable === false : tree.some(node => node.projectionAvailable === false)) &&
-      { projectionAvailable: false }) };
+    ...(incomplete && { projectionAvailable: false }) };
 }
