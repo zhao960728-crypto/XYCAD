@@ -10,16 +10,21 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { finished, pipeline } from 'node:stream/promises';
 import { MiB, formatHints, meshExtensions, uploadHint } from './public/cad-limits.mjs';
+import { projectionSettings } from './src/projection-layout.mjs';
+import { PreviewJobs } from './src/preview-jobs.mjs';
+import { savedPartImage, savedPartScene, savedPartThumbnail } from './src/sldprt-preview.mjs';
 
 const types = new Map([
   ['/index.html', 'text/html; charset=utf-8'],
   ['/style.css', 'text/css; charset=utf-8'],
   ['/viewer.mjs', 'text/javascript; charset=utf-8'],
+  ['/drawing-pdf.mjs', 'text/javascript; charset=utf-8'],
   ['/drawing-buffer.mjs', 'text/javascript; charset=utf-8'],
   ['/mesh-viewer.mjs', 'text/javascript; charset=utf-8'],
   ['/assembly-viewer.mjs', 'text/javascript; charset=utf-8'],
   ['/cad-measure.mjs', 'text/javascript; charset=utf-8'],
   ['/measure-tools.mjs', 'text/javascript; charset=utf-8'],
+  ['/weight-tools.mjs', 'text/javascript; charset=utf-8'],
   ['/cad-limits.mjs', 'text/javascript; charset=utf-8'],
   ['/sample.dxf', 'application/dxf'],
 ]);
@@ -40,6 +45,9 @@ let largeDrawingActive = false;
 const assemblyAssets = new Map();
 const assemblyTtl = 30 * 60 * 1000;
 const partPattern = /^(?:0|[1-9][0-9]{0,5})(?:\.(?:0|[1-9][0-9]{0,5})){0,48}$/;
+const standaloneScope = 'standalone';
+const previewJobs = new PreviewJobs();
+setInterval(()=>previewJobs.expire(),60_000).unref();
 
 function releaseAssembly(id, asset) {
   assemblyAssets.delete(id);
@@ -83,25 +91,35 @@ function partDetails(stdout) {
   if (bounds !== undefined && (!Array.isArray(bounds) || bounds.length !== 6 || !bounds.every(Number.isFinite) ||
       bounds.slice(0, 3).some((value, axis) => value > bounds[axis + 3]))) throw new Error('Invalid saved bounds');
   return { configurations: list, selectedConfiguration: data.selectedConfiguration, solidCount: data.solidCount,
+    ...(data.previewOnly===true&&{previewOnly:true,approximationWarnings:Array.isArray(data.approximationWarnings)?data.approximationWarnings.filter(v=>typeof v==='string').slice(0,32).map(v=>v.slice(0,500)):[]}),
     ...(bounds && { savedBounds: bounds }) };
 }
 
-async function offlinePart(file, output, response, configuration) {
+async function offlinePart(file, output, response, configuration, allowPreview=false) {
   const controller = new AbortController();
   const cancel = () => controller.abort();
   response.once('close', cancel);
   try {
     if (response.destroyed) return false;
-    const { stdout } = await run(sldprtPython, ['-I', '-S', '-B', sldprtScript, sldprtParser, file, output, configuration ?? ''],
+    const { stdout } = await run(sldprtPython, ['-I', '-S', '-B', sldprtScript, sldprtParser, file, output, configuration ?? '',allowPreview?'preview':''],
       { signal: controller.signal, timeout: 30_000, maxBuffer: 512 * 1024, windowsHide: true, env: workerEnvironment });
     const metadata = partDetails(stdout);
     if (!Number.isInteger(metadata.solidCount) || metadata.solidCount < 1 || metadata.solidCount > 256) {
       throw new Error('Invalid part solid count');
     }
     await writeFile(output + '.json', JSON.stringify(metadata), { flag: 'wx' });
+    const thumbnail=savedPartThumbnail(await readFile(file));
+    if(thumbnail)await writeFile(output+'.thumbnail.json',JSON.stringify(thumbnail),{flag:'wx'});
     return true;
   } catch (error) {
     if (controller.signal.aborted) return false;
+    let thumbnail=savedPartThumbnail(await readFile(file));
+    if(!thumbnail)thumbnail=await readFile(output+'.thumbnail').then(savedPartImage).catch(()=>null);
+    if(thumbnail&&allowPreview){
+      let details;try{details=partDetails(error.stdout);}catch{}
+      json(response,200,{scene:savedPartScene(thumbnail,'此配置的实体几何尚未完整读取，已保留文件自带的显示内容。',details)});
+      return false;
+    }
     if (error.code === 'ENOENT' || error.code === 3) {
       json(response, 503, { error: 'SLDPRT 离线解析环境不可用，请检查本机 Python 和解析器配置。' });
     } else if (error.killed) {
@@ -129,21 +147,26 @@ async function* limitPartUpload(chunks) {
   }
 }
 
-function previewInProcess(file, length, response, operation, largeDrawing, block, formatHint, part, hidden, front, cleanupUpload, asset) {
+function previewInProcess(file, length, response, operation, largeDrawing, block, formatHint, part, hidden, front, cleanupUpload, asset, projectionOptions = {}) {
   return new Promise(resolve => {
     const parasolid = formatHint === 'x_t' || formatHint === 'x_b';
     const parseSeconds = operation === 'assembly' ? 180
       : largeDrawing ? Math.min(300, 60 + Math.floor(length / (16 * MiB))) : parasolid ? 60 : 30;
     const child = spawn(process.execPath, [`--max-old-space-size=${largeDrawing ? 2048 : 768}`,
       fileURLToPath(new URL('./src/dxf-job.mjs', import.meta.url)), file,
-      operation, block, formatHint ?? '', part, hidden, front, asset?.directory ?? '', asset?.id ?? ''],
+      operation, block, formatHint ?? '', part, hidden, front, asset?.directory ?? '', asset?.id ?? '',JSON.stringify(projectionOptions)],
     { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, env: workerEnvironment });
+    const stop=()=>{
+      if(child.exitCode!==null||child.killed)return;
+      if(process.platform==='win32'&&child.pid)execFile('taskkill.exe',['/PID',String(child.pid),'/T','/F'],{windowsHide:true},()=>{});
+      else child.kill();
+    };
     let failure;
     const timeout = setTimeout(() => {
       failure = `解析超过 ${parseSeconds} 秒，请尝试拆分图纸。`;
-      child.kill();
+      stop();
     }, parseSeconds * 1000);
-    const cancel = () => { if (!response.writableFinished) child.kill(); };
+    const cancel = () => { if (!response.writableFinished) stop(); };
     response.once('close', cancel);
     const delivery = (async () => {
       const chunks = child.stdout[Symbol.asyncIterator]();
@@ -153,7 +176,7 @@ function previewInProcess(file, length, response, operation, largeDrawing, block
         const kind = String.fromCharCode(chunk[0]);
         if (!downloads[kind] && kind !== 'E' && kind !== 'J') {
           failure = '大图解析返回了无效结果。';
-          child.kill();
+          stop();
           return;
         }
         clearTimeout(timeout);
@@ -171,7 +194,7 @@ function previewInProcess(file, length, response, operation, largeDrawing, block
         }
         await pipeline(Readable.from(body()), response, { end: false });
       } catch {
-        child.kill();
+        stop();
       }
     })();
     child.once('error', () => { failure ??= '无法启动大图解析进程。'; });
@@ -184,7 +207,7 @@ function previewInProcess(file, length, response, operation, largeDrawing, block
   });
 }
 
-async function preview(request, response, operation, block, part, hidden, front) {
+async function preview(request, response, operation, block, part, hidden, front, projectionOptions = {}) {
   const requestedFormat = request.headers['x-xycad-format'];
   const projection = operation.startsWith('projection');
   const hints = projection ? meshExtensions : operation === 'preview' && !block ? formatHints : [];
@@ -215,13 +238,20 @@ async function preview(request, response, operation, block, part, hidden, front)
     return rejectUpload(503, '预览服务正在处理其他图纸，请稍后重试。');
   }
   active++;
-  let directory, file, convertedFile, asset, ownsLargeSlot = false;
+  let directory, file, convertedFile, asset, ownsLargeSlot = false, background = false;
   async function cleanupUpload() {
+    if(convertedFile)await Promise.all(['.thumbnail.json','.thumbnail'].map(suffix=>rm(convertedFile+suffix,{force:true}).catch(()=>{})));
     if (convertedFile) await rm(convertedFile + '.json', { force: true }).catch(error => console.error('无法清理配置临时文件。', error.code));
     if (convertedFile) await rm(convertedFile, { force: true }).catch(error => console.error('无法清理转换临时文件。', error.code));
     if (file) await rm(file, { force: true }).catch(error => console.error('无法清理图纸临时文件。', error.code));
     if (directory) await rmdir(directory).catch(error => console.error('无法清理图纸临时目录。', error.code));
     file = convertedFile = directory = undefined;
+  }
+  async function finalize(){
+    await cleanupUpload();
+    if(asset)await releaseAssembly(asset.id,asset);
+    if(ownsLargeSlot)largeDrawingActive=false;
+    active--;
   }
   try {
     directory = await mkdtemp(join(tmpdir(), 'xycad-upload-'));
@@ -237,9 +267,12 @@ async function preview(request, response, operation, block, part, hidden, front)
       return !length ? rejectUpload(400, emptyMessage) : rejectUpload(503, '服务正在处理另一份大图，请稍后重试。');
     }
     if (largeDrawing) largeDrawingActive = ownsLargeSlot = true;
+    async function execute(response,job){
+    if(job)job.stage=sldprt?'read-configuration':'read-geometry';
+    if(job&&sldprt){const image=savedPartThumbnail(await readFile(file));if(image)job.previewScene=savedPartScene(image,'正在后台读取实体，目前暂时显示文件保存缩略图。');}
     if (sldprt) {
       convertedFile = join(directory, 'model.step');
-      if (!await offlinePart(file, convertedFile, response, configuration)) return;
+      if (!await offlinePart(file, convertedFile, response, configuration, operation==='assembly')) return;
       ({ size: length } = await stat(convertedFile));
     }
     if (operation === 'assembly') {
@@ -252,10 +285,11 @@ async function preview(request, response, operation, block, part, hidden, front)
       asset = { id: randomUUID(), users: 1 };
       assemblyAssets.set(asset.id, asset);
       asset.directory = await mkdtemp(join(tmpdir(), 'xycad-assembly-'));
+      if(job)job.progressDirectory=asset.directory;
     }
     const { code, failure } = await previewInProcess(convertedFile ?? file, length, response, operation,
       largeDrawing || length >= largeDrawingThreshold, block, sldprt && projection ? 'step' : formatHint, part, hidden, front,
-      cleanupUpload, asset);
+      cleanupUpload, asset, projectionOptions);
     if (asset && code === 0 && !response.destroyed && response.statusCode === 200 &&
         await stat(join(asset.directory, 'scene.json')).catch(() => null)) {
       asset.expires = Date.now() + assemblyTtl;
@@ -269,6 +303,15 @@ async function preview(request, response, operation, block, part, hidden, front)
       else response.destroy();
     }
     await finished(response, { cleanup: true });
+    }
+    if(operation==='assembly'&&request.headers.prefer==='respond-async'){
+      const job=previewJobs.create(standaloneScope,async(target,state)=>{
+        try{await execute(target,state);}catch(error){if(!target.destroyed&&!target.headersSent)json(target,500,{error:'后台图纸载入未完成，请重试。'});}
+      },finalize);
+      background=true;
+      return json(response,202,{job:{id:job.id,status:'loading',pollAfterMs:600}});
+    }
+    await execute(response);
   } catch (error) {
     await cleanupUpload();
     if (!response.headersSent) response.setHeader('Connection', 'close');
@@ -276,10 +319,7 @@ async function preview(request, response, operation, block, part, hidden, front)
     else if (error.code === 'ENOSPC') json(response, 507, { error: '服务器临时磁盘空间不足。' });
     else json(response, request.complete ? 500 : 400, { error: request.complete ? '图纸临时文件读取失败。' : '图纸未完整接收。' });
   } finally {
-    await cleanupUpload();
-    if (asset) await releaseAssembly(asset.id, asset);
-    if (ownsLargeSlot) largeDrawingActive = false;
-    active--;
+    if(!background)await finalize();
   }
 }
 
@@ -308,15 +348,18 @@ async function assemblyResource(request, response, id, resource, query) {
       await pipeline(Readable.from(chunks()), response);
       return;
     }
-    const part = params.get('part') ?? '', front = params.get('front') ?? 'ny';
+    const part = params.get('part') ?? '';
+    let settings;
+    try {settings=projectionSettings(params);}catch(error){return json(response,400,{error:error.message});}
+    const {front,...projectionOptions}=settings;
     const hidden = params.get('hidden') ?? '7', format = params.get('format') ?? '';
-    if ((part && !partPattern.test(part)) || !/^[np][xyz]$/.test(front) || !/^[0-7]$/.test(hidden) ||
+    if ((part && !partPattern.test(part)) || !/^[0-7]$/.test(hidden) ||
         !['', 'pdf', 'dxf'].includes(format)) return json(response, 400, { error: '无效的装配三视图参数。' });
     if (active >= slots) return json(response, 503, { error: '预览服务正在处理其他图纸，请稍后重试。' });
     active++;
     try {
       const { code, failure } = await previewInProcess('', 0, response, 'asset-projection-' + format, false, '', '', part, hidden, front,
-        async () => {}, asset);
+        async () => {}, asset, projectionOptions);
       if (!response.headersSent) json(response, 422, { error: failure || '装配三视图未完成。' });
       else if (!response.writableEnded && !response.destroyed) {
         if (code === 0) response.end();
@@ -334,6 +377,19 @@ const server = createServer({ requestTimeout: 0, headersTimeout: 10000, connecti
   response.setHeader('X-Content-Type-Options', 'nosniff');
   response.setHeader('Referrer-Policy', 'no-referrer');
   const [route, query] = request.url.split('?', 2);
+  const previewJob=/^\/api\/preview-jobs\/([0-9a-f-]{36})$/.exec(route);
+  if(previewJob){
+    if(!['GET','DELETE'].includes(request.method))return json(response,405,{error:'只支持读取或取消载入。'});
+    const job=previewJobs.get(previewJob[1],standaloneScope);
+    if(!job)return json(response,404,{error:'找不到此载入记录，或已过期。'});
+    if(request.method==='DELETE'){previewJobs.cancel(job.id,standaloneScope);return json(response,200,{status:'cancelled'});}
+    if(job.status==='ready')return json(response,200,{status:'ready',...job.result});
+    if(job.status!=='loading')return json(response,200,{status:job.status,...job.result});
+    let progress;
+    if(job.progressDirectory)progress=await readFile(join(job.progressDirectory,'kernel-progress.json'),'utf8').then(JSON.parse).catch(()=>null);
+    return json(response,200,{status:'loading',stage:progress?.stage??job.stage,completed:progress?.completed,total:progress?.total,elapsedMs:Date.now()-job.started,
+      ...(new URLSearchParams(query).get('preview')==='1'&&job.previewScene&&{previewScene:job.previewScene})});
+  }
   const assembly = /^\/api\/assembly\/([0-9a-f-]{36})\/(mesh|projection)$/.exec(route);
   if (assembly) return assemblyResource(request, response, assembly[1], assembly[2], query);
   const partProjection = route === '/api/projection/part';
@@ -343,6 +399,7 @@ const server = createServer({ requestTimeout: 0, headersTimeout: 10000, connecti
       let operation = route === '/api/convert' ? 'convert' : 'preview';
       let hidden = '7';
       let front = 'ny';
+      let projectionOptions = {};
       if (route === '/api/export') {
         const format = params.get('format');
         if (format !== 'pdf' && format !== 'dxf') return json(response, 400, { error: '请选择 PDF 或 DXF 工程图导出格式。' });
@@ -353,8 +410,8 @@ const server = createServer({ requestTimeout: 0, headersTimeout: 10000, connecti
         if (format !== null && format !== 'dxf' && format !== 'pdf') return json(response, 400, { error: '请选择 PDF 或 DXF 三视图导出格式。' });
         hidden = params.get('hidden') ?? '7';
         if (!/^[0-7]$/.test(hidden)) return json(response, 400, { error: '无效的遮挡线设置。' });
-        front = params.get('front') ?? 'ny';
-        if (!/^[np][xyz]$/.test(front)) return json(response, 400, { error: '无效的主视方向。' });
+        try {const settings=projectionSettings(params);({front,...projectionOptions}=settings);}
+        catch(error){return json(response,400,{error:error.message});}
         operation = format ? 'projection-' + format : 'projection';
       }
       const block = route === '/api/preview' ? params.get('block') ?? '' : '';
@@ -364,7 +421,7 @@ const server = createServer({ requestTimeout: 0, headersTimeout: 10000, connecti
         return json(response, 400, { error: '无效的装配节点路径。' });
       }
       request.setTimeout(120000, () => request.destroy());
-      return preview(request, response, operation, block, part, hidden, front);
+      return preview(request, response, operation, block, part, hidden, front, projectionOptions);
     }
     response.writeHead(405, { Allow: 'POST' }).end();
     return;
